@@ -32,7 +32,7 @@ async fn main() -> Result<()> {
         "Generating {} key value pairs with range of {}",
         num_keys, key_range
     );
-    let test_data = generate_test_data(num_keys, key_range);
+    let test_data = generate_test_operations(num_keys, key_range);
 
     // Give the node time to start its event loop
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -41,32 +41,47 @@ async fn main() -> Result<()> {
     let start = Instant::now();
     let mut handles = Vec::with_capacity(test_data.len());
 
-    for data in test_data {
+    for operation in test_data {
         let sender = sender.clone();
         handles.push(tokio::spawn(async move {
             let req_start = Instant::now();
-            match data.operation {
-                Operation::Get => {
-                    let (response_sender, response_receiver) = oneshot::channel();
-                    let message = LocalMessage::Get {
-                        key: data.key,
-                        response_sender,
-                    };
-                    if let Err(e) = sender.send(message).await {
-                        error!("Error sending get operation {e}");
-                    }
-                    response_receiver.await.unwrap();
+            match operation {
+                Operation::Get { key } => {
+                    //todo!()
                 }
-                Operation::Put => {
-                    let (response_sender, response_receiver) = oneshot::channel();
-                    let message = LocalMessage::Put {
-                        key: data.key,
-                        val: data.val,
-                        response_sender,
-                    };
-                    sender.send(message).await.unwrap();
-                    response_receiver.await.unwrap();
+                Operation::Put { key, val } => {
+                    //todo!()
                 }
+                Operation::TriPut {
+                    key_1,
+                    val_1,
+                    key_2,
+                    val_2,
+                    key_3,
+                    val_3,
+                } => {
+                    //todo!()
+                } // Operation::Get => {
+                  //     let (response_sender, response_receiver) = oneshot::channel();
+                  //     let message = LocalMessage::Get {
+                  //         key: data.key,
+                  //         response_sender,
+                  //     };
+                  //     if let Err(e) = sender.send(message).await {
+                  //         error!("Error sending get operation {e}");
+                  //     }
+                  //     response_receiver.await.unwrap();
+                  // }
+                  // Operation::Put => {
+                  //     let (response_sender, response_receiver) = oneshot::channel();
+                  //     let message = LocalMessage::Put {
+                  //         key: data.key,
+                  //         val: data.val,
+                  //         response_sender,
+                  //     };
+                  //     sender.send(message).await.unwrap();
+                  //     response_receiver.await.unwrap();
+                  // }
             }
             req_start.elapsed()
         }));
@@ -96,28 +111,48 @@ async fn main() -> Result<()> {
     std::process::exit(0);
 }
 
-fn generate_test_data(num_keys: u64, key_range: u64) -> Vec<TestData> {
+fn generate_test_operations(num_operations: usize, key_range: u64) -> Vec<Operation> {
     let mut rng = rand::rng();
-    (0..num_keys)
-        .map(|_| TestData {
-            key: rng.random_range(0..key_range),
-            val: rng.random(),
-            operation: if rng.random_bool(0.8) {
-                Operation::Get
-            } else {
-                Operation::Put
+
+    (0..num_operations)
+        // generates rand number in 0..9
+        .map(|_| match rng.random_range(0..10) {
+            // range 0 or 1 (20%)
+            0..=1 => Operation::Put {
+                key: rng.random_range(0..key_range),
+                val: rng.random(),
+            },
+            // range 2 or 3 (20%)
+            2..=3 => Operation::TriPut {
+                key_1: rng.random_range(0..key_range),
+                val_1: rng.random(),
+                key_2: rng.random_range(0..key_range),
+                val_2: rng.random(),
+                key_3: rng.random_range(0..key_range),
+                val_3: rng.random(),
+            },
+            // range 4..9 (60%)
+            _ => Operation::Get {
+                key: rng.random_range(0..key_range),
             },
         })
         .collect()
 }
 
-struct TestData {
-    key: u64,
-    val: u8,
-    operation: Operation,
-}
-
 enum Operation {
-    Get,
-    Put,
+    Get {
+        key: u64,
+    },
+    Put {
+        key: u64,
+        val: u8,
+    },
+    TriPut {
+        key_1: u64,
+        val_1: u8,
+        key_2: u64,
+        val_2: u8,
+        key_3: u64,
+        val_3: u8,
+    },
 }

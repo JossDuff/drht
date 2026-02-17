@@ -1,0 +1,34 @@
+CSE 376 Assignment #2 -- 20 points
+Spring 2026
+
+Distributed Replicated Hash Table (RHT):
+
+This programming assignment involves implementing a distributed hash table (DHT) in which each element is replicated across multiple nodes (RHT).
+The specification intentionally leaves many components and designs undefined. Please document your decisions/attempts/success/failures. They will be the main topic of the grading process, along with discussing the performance evaluation of your RHT.
+
+The submission should be done through coursesite.lehigh.edu and should consist of:
+- the source code of your assignment;
+- a document containing the performance plots and the findings you consider worth to be shared with me (if any).
+
+I will grade assignments during a one-on-one meeting with you.
+
+========================
+Specification:
+
+- The RHT offers three APIs: put(K,V)/get(K)/put(<K1,V1>,<K2,V2>,<K3,V3>). The put(K,V) API is responsible for storing/replacing the value V associated with the key K. The get(K) API is responsible for retrieving the value associated with the key K. The put(<K1,V1>,<K2,V2>,<K3,V3>) stores the three keys K1,K2,K3 in the RHT atomically.
+
+- Keys are assumed to be of type int, and values can be of any type. That means, at the time the RHT is instantiated, the programmer can decide any data type for the values to be stored in the RHT. Note that we are not interested in supporting simultaneous allocation of different data types as values.
+
+- The APIs return FALSE only if they failed to execute.
+
+- Only conflicting operations should be prevented from acting in parallel. Any non-conflicting operation should be allowed to complete regardless of the existence of other concurrent operations. If you decide to use a lock table, where locks are striped, then it is fine to block operations that want to access keys whose locks map to the same lock table entry.
+
+- Each key stored in the RHT is replicated on different nodes in the system. For simplicity, you can assume the range of keys is known a priori and their mapping to nodes is also known.
+
+- Deploy the RHT on at least five nodes on Sunlab.
+
+- To test your RHT, write a simple application per process that activates 4 threads and generates a configurable number of operations on the RHT (e.g., 100000)in a closed-loop. Each operation accesses random keys. You should have 20% of probability to execute a put on a single key, 20% to execute a put on multiple keys, and 60% of probability to execute a get. For the purpose of testing, use replication degree 1 and 2.
+
+- The test application should also collect performance metrics to be included in plots. Specifically, two metrics need to be collected: average throughput (the average number of operations per second across all nodes) and average latency (the average time required for the system to complete one operation). At least two plots need to be included in your submission: one plot should have the system throughput on the y-axis for both replication degrees, and one plot should have the average latency on the y-axis for both replication degrees. Both of them have the range of keys as x-axis. The ranges of keys to use are the following {10;100;1000;10000}.
+
+- Programming Language C++.

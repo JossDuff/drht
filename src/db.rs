@@ -1,9 +1,10 @@
 use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 use tokio::sync::{Mutex, MutexGuard};
 
 pub struct StripedDb<K, V> {
-    stripes: Vec<Mutex<HashMap<K, V>>>,
+    stripes: Vec<Arc<Mutex<HashMap<K, V>>>>,
     num_stripes: usize,
 }
 
@@ -14,7 +15,7 @@ where
 {
     pub fn new(num_stripes: usize) -> Self {
         let stripes = (0..num_stripes)
-            .map(|_| Mutex::new(HashMap::new()))
+            .map(|_| Arc::new(Mutex::new(HashMap::new())))
             .collect();
         Self {
             stripes,
@@ -29,8 +30,8 @@ where
     }
 
     // for holding a mutex while waiting on network requests
-    pub async fn get_guard(&self, key: &K) -> MutexGuard<'_, HashMap<K, V>> {
-        self.stripes[self.stripe_index(key)].lock().await
+    pub fn get_stripe(&self, key: &K) -> Arc<Mutex<HashMap<K, V>>> {
+        self.stripes[self.stripe_index(key)].clone()
     }
 
     // get a value

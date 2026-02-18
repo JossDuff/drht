@@ -90,7 +90,7 @@ where
     replication_degree: usize,
     my_node_id: NodeId,
     local_inbox: mpsc::Receiver<LocalMessage<K, V>>,
-    db: Arc<StripedDb<K, V>>,
+    db: StripedDb<K, V>,
     awaiting_put_response: Arc<Mutex<HashMap<u64, oneshot::Sender<bool>>>>,
     awaiting_replica_put_response: Arc<Mutex<HashMap<u64, mpsc::Sender<bool>>>>,
     awaiting_get_response: Arc<Mutex<HashMap<u64, oneshot::Sender<Option<V>>>>>,
@@ -112,7 +112,7 @@ where
     V: Send + Sync + 'static + Debug + Serialize + for<'de> Deserialize<'de> + Clone,
 {
     pub async fn new(config: Config) -> Result<(Self, mpsc::Sender<LocalMessage<K, V>>)> {
-        let db = Arc::new(StripedDb::new(config.stripes));
+        let db = StripedDb::new(config.stripes);
         let awaiting_put_response: Arc<Mutex<HashMap<u64, oneshot::Sender<bool>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let awaiting_replica_put_response: Arc<Mutex<HashMap<u64, mpsc::Sender<bool>>>> =
@@ -224,8 +224,8 @@ where
                 let val = pair.val.clone();
 
                 // In handle_local_message for Put:
-                let db = self.db.clone();
-                let mut guard = db.get_guard(&key).await;
+                let stripe = self.db.get_stripe(&key);
+                let mut guard = stripe.lock_owned().await;
                 // TODO: should I insert after I hear back from all replicas?
                 guard.insert(key.clone(), val.clone());
 
@@ -268,10 +268,10 @@ where
                         while received < expected {
                             match ack_rx.recv().await {
                                 Some(_) => received += 1,
-                                None => break, // channel closed
+                                None => break,
                             }
                         }
-                        drop(guard); // release stripe lock
+                        drop(guard);
                         let _ = response_sender.send(true);
                     });
                 }

@@ -19,4 +19,12 @@ pub struct Config {
     /// Range of keys
     #[arg(short, long, default_value = "1000")]
     pub key_range: u64,
+
+    /// how many nodes hold each key
+    #[arg(short, long, default_value = "2")]
+    pub repication_degree: usize,
+
+    /// How many locked sections in the database
+    #[arg(short, long, default_value = "100")]
+    pub stripes: usize,
 }

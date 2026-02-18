@@ -1,8 +1,10 @@
 mod config;
+mod db;
 mod net;
 
 use anyhow::{anyhow, Result};
 pub use config::Config;
+use db::StripedDb;
 use net::{connect_all, Peers};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -58,9 +60,11 @@ pub struct Node<K, V: Clone> {
     cluster: Vec<NodeId>,
     // number of nodes that have finished their test
     done_count: AtomicUsize,
+    // how many nodes hold each key
+    replication_degree: usize,
     my_node_id: NodeId,
     local_inbox: mpsc::Receiver<LocalMessage<K, V>>,
-    db: Arc<Mutex<HashMap<K, V>>>,
+    db: Arc<StripedDb<K, V>>,
     awaiting_put_response: Arc<Mutex<HashMap<u64, oneshot::Sender<bool>>>>,
     awaiting_get_response: Arc<Mutex<HashMap<u64, oneshot::Sender<Option<V>>>>>,
 }
@@ -81,7 +85,7 @@ where
     V: Send + Sync + 'static + Debug + Serialize + for<'de> Deserialize<'de> + Clone,
 {
     pub async fn new(config: Config) -> Result<(Self, mpsc::Sender<LocalMessage<K, V>>)> {
-        let db = Arc::new(Mutex::new(HashMap::new()));
+        let db = Arc::new(StripedDb::new(config.stripes));
         let awaiting_put_response: Arc<Mutex<HashMap<u64, oneshot::Sender<bool>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let awaiting_get_response: Arc<Mutex<HashMap<u64, oneshot::Sender<Option<V>>>>> =
@@ -103,6 +107,7 @@ where
                 done_count,
                 my_node_id,
                 local_inbox,
+                replication_degree: config.repication_degree,
                 awaiting_get_response,
                 awaiting_put_response,
                 db,
@@ -114,6 +119,7 @@ where
     pub async fn run(&mut self) -> Result<()> {
         loop {
             // using tokio select because we expect to be io bound, not cpu bound
+            // TODO: make these two separate tasks
             tokio::select! {
                 Some(local_msg) = self.local_inbox.recv() => {
                     self.handle_local_message(local_msg).await?;
@@ -141,52 +147,61 @@ where
                 key,
                 response_sender,
             } => {
-                let key_owner = self.get_key_owner(&key);
+                let owners = self.get_key_owners(&key, self.replication_degree);
                 // key is locally owned, immedietly respond
-                if *key_owner == self.my_node_id {
+                if self.is_owner(&key, self.replication_degree) {
                     let resp = self.local_get(&key).await;
                     response_sender
                         .send(resp)
                         .map_err(|_| anyhow!("Receiver for local get on key {:?} dropped", key))?;
-                } else {
-                    // we need to request the key's owner
-                    let req_id: u64 = rand::rng().random();
-                    let request: PeerMessage<K, V> = PeerMessage::Get { key, req_id };
-                    self.peers.send(key_owner, request).await?;
-
-                    // create a task awaiting the response from a peer
-                    let mut awaiting_get_response = self.awaiting_get_response.lock().await;
-                    let (get_sender, get_receiver) = oneshot::channel();
-                    awaiting_get_response.insert(req_id, get_sender);
-
-                    // start a non-blocking task that awaits this response and sends back to test
-                    // harness
-                    tokio::spawn(async move {
-                        match get_receiver.await {
-                            Ok(peer_get_response) => {
-                                // send get response back to test harness
-                                let _ = response_sender.send(peer_get_response);
-                            }
-                            Err(e) => {
-                                error!("Receive error waiting for getResponse: {}", e);
-                            }
-                        }
-                    });
+                    return Ok(());
                 }
+
+                // just request one of the key's owners (assume replication is correct)
+                let key_owner = owners
+                    .first()
+                    .ok_or(anyhow!("No owner found for key {:?}", key))?;
+
+                let req_id: u64 = rand::rng().random();
+                let request: PeerMessage<K, V> = PeerMessage::Get { key, req_id };
+                self.peers.send(key_owner, request).await?;
+
+                // create a task awaiting the response from a peer
+                let mut awaiting_get_response = self.awaiting_get_response.lock().await;
+                let (get_sender, get_receiver) = oneshot::channel();
+                awaiting_get_response.insert(req_id, get_sender);
+
+                // start a non-blocking task that awaits this response and sends back to test
+                // harness
+                tokio::spawn(async move {
+                    match get_receiver.await {
+                        Ok(peer_get_response) => {
+                            // send get response back to test harness
+                            let _ = response_sender.send(peer_get_response);
+                        }
+                        Err(e) => {
+                            error!("Receive error waiting for getResponse: {}", e);
+                        }
+                    }
+                });
             }
             LocalMessage::Put {
                 key,
                 val,
                 response_sender,
             } => {
-                let key_owner = self.get_key_owner(&key);
+                let owners = self.get_key_owners(&key, self.replication_degree);
+                // TODO: this is more complicated than Get
                 // key is locally owned, immedietly respond
-                if *key_owner == self.my_node_id {
+                if self.is_owner(&key, self.replication_degree) {
                     let resp = self.local_insert(key, val).await;
                     response_sender
                         .send(resp)
                         .map_err(|_| anyhow!("Receiver for local put on key {:?} dropped", key))?;
-                } else {
+                    return Ok(());
+                }
+
+                for key_owner in owners {
                     // we need to request the key's owner
                     let req_id: u64 = rand::rng().random();
                     let request: PeerMessage<K, V> = PeerMessage::Put { key, req_id, val };
@@ -322,11 +337,153 @@ where
         }
     }
 
-    // maps the key to the sunlab node who stores the value
-    fn get_key_owner(&self, key: &K) -> &NodeId {
-        let mut hasher = DefaultHasher::new();
-        key.hash(&mut hasher);
-        let cluster_index = (hasher.finish() as usize) % self.cluster.len();
-        &self.cluster[cluster_index]
+    // maps the key to the owner nodes
+    fn get_key_owners(&self, key: &K, replication_degree: usize) -> Vec<&NodeId> {
+        key_owner_indices(key, self.cluster.len(), replication_degree)
+            .into_iter()
+            .map(|i| &self.cluster[i])
+            .collect()
+    }
+
+    // convience function
+    fn is_owner(&self, key: &K, replication_degree: usize) -> bool {
+        self.get_key_owners(key, replication_degree)
+            .iter()
+            .any(|id| **id == self.my_node_id)
+    }
+}
+
+// Pure function: given a sorted cluster and replication degree, return the
+// indices of nodes that own this key.
+// Separated for testing logic
+fn key_owner_indices<K: Hash>(
+    key: &K,
+    cluster_len: usize,
+    replication_degree: usize,
+) -> Vec<usize> {
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    let start = (hasher.finish() as usize) % cluster_len;
+    let degree = replication_degree.min(cluster_len);
+
+    (0..degree).map(|i| (start + i) % cluster_len).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_cluster(n: usize) -> Vec<NodeId> {
+        let names = [
+            "ariel", "caliban", "callisto", "ceres", "chiron", "cupid", "eris", "europa", "hydra",
+            "iapetus",
+        ];
+        (0..n)
+            .map(|i| NodeId {
+                sunlab_name: names[i].to_string(),
+                id: i,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn single_owner_returns_one_node() {
+        let cluster = make_cluster(5);
+        let key: u64 = 42;
+        let owners = key_owner_indices(&key, cluster.len(), 1);
+        assert_eq!(owners.len(), 1);
+        assert!(owners[0] < cluster.len());
+    }
+
+    #[test]
+    fn replication_degree_returns_correct_count() {
+        let cluster = make_cluster(5);
+        let key: u64 = 42;
+
+        for degree in 1..=5 {
+            let owners = key_owner_indices(&key, cluster.len(), degree);
+            assert_eq!(owners.len(), degree);
+        }
+    }
+
+    #[test]
+    fn no_duplicate_owners() {
+        let cluster = make_cluster(5);
+        let key: u64 = 99;
+        let owners = key_owner_indices(&key, cluster.len(), 5);
+
+        let mut unique = owners.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), owners.len());
+    }
+
+    #[test]
+    fn owners_are_contiguous_on_ring() {
+        let cluster = make_cluster(5);
+        let key: u64 = 7;
+        let owners = key_owner_indices(&key, cluster.len(), 3);
+
+        // each subsequent owner should be (prev + 1) % cluster_len
+        for i in 1..owners.len() {
+            assert_eq!(owners[i], (owners[i - 1] + 1) % cluster.len());
+        }
+    }
+
+    #[test]
+    fn degree_capped_at_cluster_size() {
+        let cluster = make_cluster(3);
+        let key: u64 = 55;
+        // request degree 10 but only 3 nodes exist
+        let owners = key_owner_indices(&key, cluster.len(), 10);
+        assert_eq!(owners.len(), 3);
+    }
+
+    #[test]
+    fn same_key_same_owners() {
+        let cluster = make_cluster(5);
+        let key: u64 = 123;
+        let a = key_owner_indices(&key, cluster.len(), 2);
+        let b = key_owner_indices(&key, cluster.len(), 2);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn different_keys_distribute() {
+        let cluster = make_cluster(5);
+        let mut primary_counts = vec![0usize; cluster.len()];
+
+        // hash a bunch of keys and count which node is primary
+        for key in 0u64..1000 {
+            let owners = key_owner_indices(&key, cluster.len(), 1);
+            primary_counts[owners[0]] += 1;
+        }
+
+        // every node should get at least some keys (sanity check distribution)
+        for (i, count) in primary_counts.iter().enumerate() {
+            assert!(
+                *count > 50,
+                "node {} only got {} keys out of 1000, distribution looks broken",
+                i,
+                count
+            );
+        }
+    }
+
+    #[test]
+    fn wraps_around_ring() {
+        let cluster = make_cluster(5);
+        // find a key whose primary is the last node
+        let key = (0u64..10000)
+            .find(|k| {
+                let owners = key_owner_indices(k, cluster.len(), 1);
+                owners[0] == cluster.len() - 1
+            })
+            .expect("should find a key mapping to last node");
+
+        let owners = key_owner_indices(&key, cluster.len(), 3);
+        assert_eq!(owners[0], cluster.len() - 1);
+        assert_eq!(owners[1], 0); // wraps to first node
+        assert_eq!(owners[2], 1);
     }
 }

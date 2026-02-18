@@ -31,6 +31,7 @@ where
     Put { pair: KVPair<K, V>, req_id: u64 },
     PutResponse { success: bool, req_id: u64 },
     ReplicaPut { pair: KVPair<K, V>, req_id: u64 },
+    ReplicaPutAck { success: bool, req_id: u64 },
     Done,
 }
 
@@ -216,6 +217,7 @@ where
                     }
                 });
             }
+            // TODO: test the fire-and-forget method for sending puts to replicas
             LocalMessage::Put {
                 pair,
                 response_sender,
@@ -354,6 +356,33 @@ where
                         // send the response for the local task awaiting it
                         sender.send(success).map_err(|_| {
                             anyhow!("Error sending local PutResponse for request {}", req_id)
+                        })?;
+                    }
+                    None => {
+                        return Err(anyhow!("Receiver for req_id {} dropped", req_id));
+                    }
+                };
+            }
+            PeerMessage::ReplicaPut { pair, req_id } => {
+                let result = self.db.put(pair.key, pair.val).await;
+                let resp = PeerMessage::ReplicaPutAck {
+                    success: result,
+                    req_id,
+                };
+                self.peers
+                    .send(&from, resp)
+                    .await
+                    .map_err(|e| anyhow!("Error sending ReplicaPutAck to node {}: {}", from, e))?;
+            }
+            // collect acks from replicas that a put was successful
+            PeerMessage::ReplicaPutAck { success, req_id } => {
+                let mut awaiting_replica_put_response =
+                    self.awaiting_replica_put_response.lock().await;
+                // send to task waiting for n acks before dropping lock
+                match awaiting_replica_put_response.remove(&req_id) {
+                    Some(sender) => {
+                        sender.send(success).await.map_err(|_| {
+                            anyhow!("Error sending ReplicaPutAck for request {}", req_id)
                         })?;
                     }
                     None => {

@@ -21,23 +21,45 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, error, info};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum PeerMessage<K, V> {
+pub enum PeerMessage<K, V>
+where
+    V: Clone,
+    K: Clone,
+{
     Get { key: K, req_id: u64 },
     GetResponse { val: Option<V>, req_id: u64 },
-    Put { key: K, val: V, req_id: u64 },
+    Put { pair: KVPair<K, V>, req_id: u64 },
     PutResponse { success: bool, req_id: u64 },
+    ReplicaPut { pair: KVPair<K, V>, req_id: u64 },
     Done,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct KVPair<K, V>
+where
+    V: Clone,
+    K: Clone,
+{
+    key: K,
+    val: V,
+}
+
 #[derive(Debug)]
-pub enum LocalMessage<K, V: Clone> {
+pub enum LocalMessage<K, V>
+where
+    V: Clone,
+    K: Clone,
+{
     Get {
         key: K,
         response_sender: oneshot::Sender<Option<V>>,
     },
     Put {
-        key: K,
-        val: V,
+        pair: KVPair<K, V>,
+        response_sender: oneshot::Sender<bool>,
+    },
+    TriPut {
+        pairs: [KVPair<K, V>; 3],
         response_sender: oneshot::Sender<bool>,
     },
 }
@@ -54,7 +76,11 @@ impl fmt::Display for NodeId {
     }
 }
 
-pub struct Node<K, V: Clone> {
+pub struct Node<K, V>
+where
+    V: Clone,
+    K: Clone,
+{
     peers: Peers<K, V>,
     // all the nodes in this cluster, in consistent ordering
     cluster: Vec<NodeId>,
@@ -66,6 +92,7 @@ pub struct Node<K, V: Clone> {
     local_inbox: mpsc::Receiver<LocalMessage<K, V>>,
     db: Arc<StripedDb<K, V>>,
     awaiting_put_response: Arc<Mutex<HashMap<u64, oneshot::Sender<bool>>>>,
+    awaiting_replica_put_response: Arc<Mutex<HashMap<u64, mpsc::Sender<bool>>>>,
     awaiting_get_response: Arc<Mutex<HashMap<u64, oneshot::Sender<Option<V>>>>>,
 }
 
@@ -87,6 +114,8 @@ where
     pub async fn new(config: Config) -> Result<(Self, mpsc::Sender<LocalMessage<K, V>>)> {
         let db = Arc::new(StripedDb::new(config.stripes));
         let awaiting_put_response: Arc<Mutex<HashMap<u64, oneshot::Sender<bool>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let awaiting_replica_put_response: Arc<Mutex<HashMap<u64, mpsc::Sender<bool>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let awaiting_get_response: Arc<Mutex<HashMap<u64, oneshot::Sender<Option<V>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -110,6 +139,7 @@ where
                 replication_degree: config.repication_degree,
                 awaiting_get_response,
                 awaiting_put_response,
+                awaiting_replica_put_response,
                 db,
             },
             local_sender,
@@ -147,10 +177,11 @@ where
                 key,
                 response_sender,
             } => {
-                let owners = self.get_key_owners(&key, self.replication_degree);
+                let owners = self.get_key_owners(&key);
+
                 // key is locally owned, immedietly respond
                 if self.is_owner(&key, self.replication_degree) {
-                    let resp = self.local_get(&key).await;
+                    let resp = self.db.get(&key).await;
                     response_sender
                         .send(resp)
                         .map_err(|_| anyhow!("Receiver for local get on key {:?} dropped", key))?;
@@ -186,46 +217,70 @@ where
                 });
             }
             LocalMessage::Put {
-                key,
-                val,
+                pair,
                 response_sender,
             } => {
-                let owners = self.get_key_owners(&key, self.replication_degree);
-                // TODO: this is more complicated than Get
-                // key is locally owned, immedietly respond
-                if self.is_owner(&key, self.replication_degree) {
-                    let resp = self.local_insert(key, val).await;
-                    response_sender
-                        .send(resp)
-                        .map_err(|_| anyhow!("Receiver for local put on key {:?} dropped", key))?;
-                    return Ok(());
-                }
+                let key = pair.key.clone();
+                let val = pair.val.clone();
 
-                for key_owner in owners {
-                    // we need to request the key's owner
+                // In handle_local_message for Put:
+                let db = self.db.clone();
+                let mut guard = db.get_guard(&key).await;
+                // TODO: should I insert after I hear back from all replicas?
+                guard.insert(key.clone(), val.clone());
+
+                // Collect remote owners (excluding self)
+                let remote_owners: Vec<NodeId> = self
+                    .get_key_owners(&key)
+                    .into_iter()
+                    .filter(|x| **x != self.my_node_id)
+                    .cloned()
+                    .collect();
+
+                // there are no other owners of this key, we're done
+                if remote_owners.is_empty() {
+                    drop(guard);
+                    let _ = response_sender.send(true);
+                } else {
+                    // One channel per replica ack
+                    let (ack_tx, mut ack_rx) = mpsc::channel(remote_owners.len());
                     let req_id: u64 = rand::rng().random();
-                    let request: PeerMessage<K, V> = PeerMessage::Put { key, req_id, val };
-                    self.peers.send(key_owner, request).await?;
+                    let expected = remote_owners.len();
 
-                    // create a task awaiting the response from a peer
-                    let mut awaiting_put_response = self.awaiting_put_response.lock().await;
-                    let (put_sender, put_receiver) = oneshot::channel();
-                    awaiting_put_response.insert(req_id, put_sender);
+                    // Register ack sender so handle_peer_message can forward acks
+                    self.awaiting_replica_put_response
+                        .lock()
+                        .await
+                        .insert(req_id, ack_tx);
 
-                    // start a non-blocking task that awaits this response and sends back to test
-                    // harness
+                    // send put request to all replicas
+                    for owner in &remote_owners {
+                        let msg = PeerMessage::ReplicaPut {
+                            pair: pair.clone(),
+                            req_id,
+                        };
+                        self.peers.send(owner, msg).await?;
+                    }
+
+                    // Spawn task that holds the guard until all acks arrive
                     tokio::spawn(async move {
-                        match put_receiver.await {
-                            Ok(peer_put_response) => {
-                                // send get response back to test harness
-                                let _ = response_sender.send(peer_put_response);
-                            }
-                            Err(e) => {
-                                error!("Receive error waiting for putResponse: {}", e);
+                        let mut received = 0;
+                        while received < expected {
+                            match ack_rx.recv().await {
+                                Some(_) => received += 1,
+                                None => break, // channel closed
                             }
                         }
+                        drop(guard); // release stripe lock
+                        let _ = response_sender.send(true);
                     });
                 }
+            }
+            LocalMessage::TriPut {
+                pairs,
+                response_sender,
+            } => {
+                todo!()
             }
         }
 
@@ -238,7 +293,7 @@ where
         match msg {
             // peer is asking us for a get request
             PeerMessage::Get { key, req_id } => {
-                let result = self.local_get(&key).await;
+                let result = self.db.get(&key).await;
                 let resp: PeerMessage<K, V> = PeerMessage::GetResponse {
                     val: result,
                     req_id,
@@ -255,8 +310,10 @@ where
                 );
             }
             // peer is asking us for a put request
-            PeerMessage::Put { key, val, req_id } => {
-                let result = self.local_insert(key, val).await;
+            PeerMessage::Put { pair, req_id } => {
+                let key = pair.key;
+                let val = pair.val;
+                let result = self.db.put(key, val).await;
                 let resp: PeerMessage<K, V> = PeerMessage::PutResponse {
                     success: result,
                     req_id,
@@ -318,28 +375,9 @@ where
         Ok(false)
     }
 
-    async fn local_get(&self, key: &K) -> Option<V> {
-        let db = self.db.lock().await;
-        db.get(key).cloned()
-    }
-
-    async fn local_insert(&self, key: K, value: V) -> bool {
-        let mut db = self.db.lock().await;
-
-        match db.get(&key) {
-            // an element already exists, return false
-            Some(_) => false,
-            // there is no element, insert and return true
-            None => {
-                let _ = db.insert(key, value);
-                true
-            }
-        }
-    }
-
     // maps the key to the owner nodes
-    fn get_key_owners(&self, key: &K, replication_degree: usize) -> Vec<&NodeId> {
-        key_owner_indices(key, self.cluster.len(), replication_degree)
+    fn get_key_owners(&self, key: &K) -> Vec<&NodeId> {
+        key_owner_indices(key, self.cluster.len(), self.replication_degree)
             .into_iter()
             .map(|i| &self.cluster[i])
             .collect()
@@ -347,7 +385,7 @@ where
 
     // convience function
     fn is_owner(&self, key: &K, replication_degree: usize) -> bool {
-        self.get_key_owners(key, replication_degree)
+        self.get_key_owners(key)
             .iter()
             .any(|id| **id == self.my_node_id)
     }

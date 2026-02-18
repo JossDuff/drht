@@ -1,6 +1,6 @@
 use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::hash::{Hash, Hasher};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 
 pub struct StripedDb<K, V> {
     stripes: Vec<Mutex<HashMap<K, V>>>,
@@ -26,6 +26,11 @@ where
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
         (hasher.finish() as usize) % self.num_stripes
+    }
+
+    // for holding a mutex while waiting on network requests
+    pub async fn get_guard(&self, key: &K) -> MutexGuard<'_, HashMap<K, V>> {
+        self.stripes[self.stripe_index(key)].lock().await
     }
 
     // get a value

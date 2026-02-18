@@ -140,19 +140,7 @@ fn generate_test_operations(num_operations: usize, key_range: u64) -> Vec<Operat
 }
 
 enum Operation {
-    Get {
-        key: u64,
-    },
-    Put {
-        key: u64,
-        val: u8,
-    },
-    TriPut {
-        key_1: u64,
-        val_1: u8,
-        key_2: u64,
-        val_2: u8,
-        key_3: u64,
-        val_3: u8,
-    },
+    Get { key: u64 },
+    Put { pair: KVPair },
+    TriPut { pairs: [KVPair; 3] },
 }

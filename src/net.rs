@@ -16,15 +16,15 @@ const PORT: u64 = 1895;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReadyPeerMessage(NodeId);
 
-pub struct Peers<K, V> {
+pub struct Peers<K: Clone, V: Clone> {
     pub inbox: mpsc::Receiver<(NodeId, PeerMessage<K, V>)>,
     pub senders: HashMap<NodeId, mpsc::Sender<PeerMessage<K, V>>>,
 }
 
 impl<K, V> Peers<K, V>
 where
-    K: Send + Sync + 'static + Hash,
-    V: Send + Sync + 'static,
+    K: Send + Sync + 'static + Hash + Clone,
+    V: Send + Sync + 'static + Clone,
 {
     // send message to single node
     pub async fn send(&self, to: &NodeId, msg: PeerMessage<K, V>) -> Result<()> {
@@ -42,8 +42,8 @@ async fn writer_task<K, V>(
     mut write_half: tokio::net::tcp::OwnedWriteHalf,
     mut outbox: mpsc::Receiver<PeerMessage<K, V>>,
 ) where
-    K: Serialize + for<'de> Deserialize<'de>,
-    V: Serialize + for<'de> Deserialize<'de>,
+    K: Serialize + for<'de> Deserialize<'de> + Clone,
+    V: Serialize + for<'de> Deserialize<'de> + Clone,
 {
     while let Some(msg) = outbox.recv().await {
         if let Err(e) = send_msg(&mut write_half, &msg).await {
@@ -58,8 +58,8 @@ async fn reader_task<K, V>(
     mut read_half: tokio::net::tcp::OwnedReadHalf,
     inbox: mpsc::Sender<(NodeId, PeerMessage<K, V>)>,
 ) where
-    K: Serialize + for<'de> Deserialize<'de>,
-    V: Serialize + for<'de> Deserialize<'de>,
+    K: Serialize + for<'de> Deserialize<'de> + Clone,
+    V: Serialize + for<'de> Deserialize<'de> + Clone,
 {
     loop {
         match recv_msg(&mut read_half).await {
@@ -111,8 +111,8 @@ pub async fn connect_all<K, V>(
     sunlab_nodes: &Vec<String>,
 ) -> Result<(Peers<K, V>, Vec<NodeId>, NodeId)>
 where
-    K: Serialize + for<'de> Deserialize<'de> + std::marker::Send + Sync + 'static,
-    V: Serialize + for<'de> Deserialize<'de> + std::marker::Send + Sync + 'static,
+    K: Serialize + for<'de> Deserialize<'de> + std::marker::Send + Sync + 'static + Clone,
+    V: Serialize + for<'de> Deserialize<'de> + std::marker::Send + Sync + 'static + Clone,
 {
     let listen_addr = format!("0.0.0.0:{PORT}");
     let listener = TcpListener::bind(&listen_addr).await?;

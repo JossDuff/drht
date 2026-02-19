@@ -187,32 +187,30 @@ where
                     response_sender
                         .send(resp)
                         .map_err(|_| anyhow!("Receiver for local get on key {:?} dropped", key))?;
-                    return Ok(());
                 } else {
+                    let req_id: u64 = rand::rng().random();
+                    let request: PeerMessage<K, V> = PeerMessage::Get { key, req_id };
+                    self.peers.send(primary_replica, request).await?;
+
+                    // create a task awaiting the response from a peer
+                    let mut awaiting_get_response = self.awaiting_get_response.lock().await;
+                    let (get_sender, get_receiver) = oneshot::channel();
+                    awaiting_get_response.insert(req_id, get_sender);
+
+                    // start a non-blocking task that awaits this response and sends back to test
+                    // harness
+                    tokio::spawn(async move {
+                        match get_receiver.await {
+                            Ok(peer_get_response) => {
+                                // send get response back to test harness
+                                let _ = response_sender.send(peer_get_response);
+                            }
+                            Err(e) => {
+                                error!("Receive error waiting for getResponse: {}", e);
+                            }
+                        }
+                    });
                 }
-
-                let req_id: u64 = rand::rng().random();
-                let request: PeerMessage<K, V> = PeerMessage::Get { key, req_id };
-                self.peers.send(primary_replica, request).await?;
-
-                // create a task awaiting the response from a peer
-                let mut awaiting_get_response = self.awaiting_get_response.lock().await;
-                let (get_sender, get_receiver) = oneshot::channel();
-                awaiting_get_response.insert(req_id, get_sender);
-
-                // start a non-blocking task that awaits this response and sends back to test
-                // harness
-                tokio::spawn(async move {
-                    match get_receiver.await {
-                        Ok(peer_get_response) => {
-                            // send get response back to test harness
-                            let _ = response_sender.send(peer_get_response);
-                        }
-                        Err(e) => {
-                            error!("Receive error waiting for getResponse: {}", e);
-                        }
-                    }
-                });
             }
             LocalMessage::Put {
                 pair,
@@ -236,12 +234,14 @@ where
                     // make the write and broadcast to the other replicas.  Don't need to wait for
                     // a response because we assume no crashes
                     self.db.put(key, val).await;
+                    // respond to test harness
+                    let _ = response_sender.send(true);
 
                     let req = PeerMessage::ReplicaPut { pair };
                     let other_replicas: Vec<&NodeId> =
                         replicas.iter().filter(|x| **x != self.my_node_id).collect();
                     for replica in other_replicas {
-                        self.peers.send(replica, req.clone()).await;
+                        self.peers.send(replica, req.clone()).await?;
                     }
                 } else {
                     // send this request to the primary replica and await the response
@@ -255,7 +255,7 @@ where
                     let (put_sender, put_receiver) = oneshot::channel();
                     awaiting_put_response.insert(req_id, put_sender);
 
-                    // start a non-blocking task that awaits this response and sends back to test
+                    // start a non-blocking task that awaits the response from the primary and sends back to test
                     // harness
                     tokio::spawn(async move {
                         match put_receiver.await {
@@ -285,7 +285,7 @@ where
     async fn handle_peer_message(&self, from: NodeId, msg: PeerMessage<K, V>) -> Result<bool> {
         debug!("Got {:?} from {}", msg, from);
         match msg {
-            // peer is asking us for a get request
+            // peer is asking us for a get request because we are the primary replica
             PeerMessage::Get { key, req_id } => {
                 let result = self.db.get(&key).await;
                 let resp: PeerMessage<K, V> = PeerMessage::GetResponse {
@@ -329,6 +329,10 @@ where
                     .await
                     .map_err(|e| anyhow!("Error sending PutResponse to node {}: {}", from, e))?;
             }
+            // the primary replica is telling us to execute this put
+            PeerMessage::ReplicaPut { pair } => {
+                self.db.put(pair.key, pair.val).await;
+            }
             // received a response from a peer about a previous get request
             PeerMessage::GetResponse { val, req_id } => {
                 // look up the channel for sending the response
@@ -360,10 +364,6 @@ where
                         return Err(anyhow!("Receiver for req_id {} dropped", req_id));
                     }
                 };
-            }
-            // the primary replica is telling us to execute this put
-            PeerMessage::ReplicaPut { pair } => {
-                self.db.put(pair.key, pair.val).await;
             }
             // a peer has finished their test
             PeerMessage::Done => {

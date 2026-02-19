@@ -16,10 +16,14 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
+    time::Duration,
 };
 use tokio::sync::OwnedMutexGuard;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, error, info};
+
+const PREPARE_LOCK_TIMEOUT: Duration = Duration::from_millis(50);
+const COORDINATOR_VOTE_TIMEOUT: Duration = Duration::from_millis(200);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum PeerMessage<K, V>
@@ -59,6 +63,10 @@ where
     },
     // Primary replica responding to coordinator saying they're ready to commit
     VotePrepared {
+        tx_id: u64,
+    },
+    // Primary replica responding to coordinator saying they can't acquire locks
+    VoteAbort {
         tx_id: u64,
     },
     // After coordinator has heard back from all nodes, broadcast to all primary replicas
@@ -368,23 +376,43 @@ where
 
                         let mut guards: HashMap<usize, OwnedMutexGuard<HashMap<K, V>>> =
                             HashMap::new();
+                        let mut lock_failed = false;
                         for (_, idx) in &local_entries {
                             if !guards.contains_key(idx) {
                                 let stripe = db.get_stripe_by_index(*idx);
-                                guards.insert(*idx, stripe.lock_owned().await);
+                                match tokio::time::timeout(
+                                    PREPARE_LOCK_TIMEOUT,
+                                    stripe.lock_owned(),
+                                )
+                                .await
+                                {
+                                    Ok(guard) => {
+                                        guards.insert(*idx, guard);
+                                    }
+                                    Err(_) => {
+                                        debug!("Local prepare lock timeout for tx {}", tx_id);
+                                        lock_failed = true;
+                                        break;
+                                    }
+                                }
                             }
                         }
 
-                        pending_prepares.lock().await.insert(
-                            tx_id,
-                            PendingTx {
-                                pairs: local_entries,
-                                guards,
-                            },
-                        );
+                        if lock_failed {
+                            // Vote abort — drop any acquired guards
+                            let _ = vote_tx_clone.send(false).await;
+                        } else {
+                            pending_prepares.lock().await.insert(
+                                tx_id,
+                                PendingTx {
+                                    pairs: local_entries,
+                                    guards,
+                                },
+                            );
 
-                        // Local prepare always succeeds
-                        let _ = vote_tx_clone.send(true).await;
+                            // Local prepare succeeds
+                            let _ = vote_tx_clone.send(true).await;
+                        }
                     });
                 }
 
@@ -415,16 +443,19 @@ where
 
                 // Spawn coordinator task to collect votes and commit/abort
                 tokio::spawn(async move {
-                    let mut all_prepared = true;
-                    for _ in 0..total_primaries {
-                        match vote_rx.recv().await {
-                            Some(true) => {}
-                            _ => {
-                                all_prepared = false;
-                                break;
+                    // Collect votes with a timeout to prevent distributed deadlock
+                    let collect_result = tokio::time::timeout(COORDINATOR_VOTE_TIMEOUT, async {
+                        for _ in 0..total_primaries {
+                            match vote_rx.recv().await {
+                                Some(true) => {}
+                                _ => return false,
                             }
                         }
-                    }
+                        true
+                    })
+                    .await;
+
+                    let all_prepared = matches!(collect_result, Ok(true));
 
                     awaiting_votes.lock().await.remove(&tx_id);
 
@@ -608,28 +639,51 @@ where
                         .collect();
                     entries.sort_by_key(|(_, idx)| *idx);
 
-                    // Acquire stripe locks in sorted order
+                    // Acquire stripe locks in sorted order with timeout
                     let mut guards: HashMap<usize, OwnedMutexGuard<HashMap<K, V>>> = HashMap::new();
+                    let mut lock_failed = false;
                     for (_, idx) in &entries {
                         if !guards.contains_key(idx) {
                             let stripe = db.get_stripe_by_index(*idx);
-                            guards.insert(*idx, stripe.lock_owned().await);
+                            match tokio::time::timeout(PREPARE_LOCK_TIMEOUT, stripe.lock_owned())
+                                .await
+                            {
+                                Ok(guard) => {
+                                    guards.insert(*idx, guard);
+                                }
+                                Err(_) => {
+                                    debug!(
+                                        "Prepare lock timeout for tx {} on stripe {}",
+                                        tx_id, idx
+                                    );
+                                    lock_failed = true;
+                                    break;
+                                }
+                            }
                         }
                     }
 
-                    // Store pending transaction
-                    pending_prepares.lock().await.insert(
-                        tx_id,
-                        PendingTx {
-                            pairs: entries,
-                            guards,
-                        },
-                    );
+                    if lock_failed {
+                        // Vote abort — drop any acquired guards
+                        if let Some(sender) = senders.get(&from) {
+                            let resp = PeerMessage::VoteAbort { tx_id };
+                            let _ = sender.send(resp).await;
+                        }
+                    } else {
+                        // Store pending transaction
+                        pending_prepares.lock().await.insert(
+                            tx_id,
+                            PendingTx {
+                                pairs: entries,
+                                guards,
+                            },
+                        );
 
-                    // Vote prepared
-                    if let Some(sender) = senders.get(&from) {
-                        let resp = PeerMessage::VotePrepared { tx_id };
-                        let _ = sender.send(resp).await;
+                        // Vote prepared
+                        if let Some(sender) = senders.get(&from) {
+                            let resp = PeerMessage::VotePrepared { tx_id };
+                            let _ = sender.send(resp).await;
+                        }
                     }
                 });
             }
@@ -638,6 +692,13 @@ where
                 let awaiting = self.awaiting_votes.lock().await;
                 if let Some(tx) = awaiting.get(&tx_id) {
                     let _ = tx.send(true).await;
+                }
+            }
+            // Coordinator receives an abort vote from a primary replica
+            PeerMessage::VoteAbort { tx_id } => {
+                let awaiting = self.awaiting_votes.lock().await;
+                if let Some(tx) = awaiting.get(&tx_id) {
+                    let _ = tx.send(false).await;
                 }
             }
             // primary replica can commit a txn

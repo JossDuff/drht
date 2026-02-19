@@ -17,6 +17,7 @@ use std::{
         Arc,
     },
 };
+use tokio::sync::OwnedMutexGuard;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, error, info};
 
@@ -27,24 +28,47 @@ where
     K: Clone,
 {
     // asking a primary replica for a get
-    Get { key: K, req_id: u64 },
+    Get {
+        key: K,
+        req_id: u64,
+    },
     // primary replica responding to a get request
-    GetResponse { val: Option<V>, req_id: u64 },
+    GetResponse {
+        val: Option<V>,
+        req_id: u64,
+    },
     // asking a primary replica for a put
-    Put { pair: KVPair<K, V>, req_id: u64 },
+    Put {
+        pair: KVPair<K, V>,
+        req_id: u64,
+    },
     // primary replica responding to a put request
-    PutResponse { success: bool, req_id: u64 },
+    PutResponse {
+        success: bool,
+        req_id: u64,
+    },
     // message from a primary replica to process a put
-    ReplicaPut { pair: KVPair<K, V> },
+    ReplicaPut {
+        pair: KVPair<K, V>,
+    },
     // 2PC messages:
     // Coordinator asking primary replicas to ready for a PUT
-    Prepare { pair: KVPair<K, V>, req_id: u64 },
+    Prepare {
+        pairs: Vec<KVPair<K, V>>,
+        tx_id: u64,
+    },
     // Primary replica responding to coordinator saying they're ready to commit
-    VotePrepared { req_id: u64 },
+    VotePrepared {
+        tx_id: u64,
+    },
     // After coordinator has heard back from all nodes, broadcast to all primary replicas
     // Primary replicas either commit or abort the PUT
-    Commit { req_id: u64 },
-    Abort { req_id: u64 },
+    Commit {
+        tx_id: u64,
+    },
+    Abort {
+        tx_id: u64,
+    },
     // This node has finished its tests
     Done,
 }
@@ -91,6 +115,11 @@ impl fmt::Display for NodeId {
     }
 }
 
+struct PendingTx<K: Clone, V: Clone> {
+    pairs: Vec<(KVPair<K, V>, usize)>, // (pair, stripe_index)
+    guards: HashMap<usize, OwnedMutexGuard<HashMap<K, V>>>,
+}
+
 pub struct Node<K, V>
 where
     V: Clone,
@@ -108,6 +137,10 @@ where
     db: StripedDb<K, V>,
     awaiting_put_response: Arc<Mutex<HashMap<u64, oneshot::Sender<bool>>>>,
     awaiting_get_response: Arc<Mutex<HashMap<u64, oneshot::Sender<Option<V>>>>>,
+    // Participant: holds locks between Prepare and Commit/Abort
+    pending_prepares: Arc<Mutex<HashMap<u64, PendingTx<K, V>>>>,
+    // Coordinator: channels for collecting votes
+    awaiting_votes: Arc<Mutex<HashMap<u64, mpsc::Sender<bool>>>>,
 }
 
 impl<K, V> Node<K, V>
@@ -131,6 +164,10 @@ where
             Arc::new(Mutex::new(HashMap::new()));
         let awaiting_get_response: Arc<Mutex<HashMap<u64, oneshot::Sender<Option<V>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let pending_prepares: Arc<Mutex<HashMap<u64, PendingTx<K, V>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let awaiting_votes: Arc<Mutex<HashMap<u64, mpsc::Sender<bool>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
         // this is a barrier
         let (peers, cluster, my_node_id): (Peers<K, V>, Vec<NodeId>, NodeId) =
@@ -151,6 +188,8 @@ where
                 replication_degree: config.repication_degree,
                 awaiting_get_response,
                 awaiting_put_response,
+                pending_prepares,
+                awaiting_votes,
                 db,
             },
             local_sender,
@@ -285,11 +324,158 @@ where
                     });
                 }
             }
+            // This node serves as the coordinator
             LocalMessage::TriPut {
                 pairs,
                 response_sender,
             } => {
-                todo!()
+                let tx_id: u64 = rand::rng().random();
+
+                // Group pairs by primary, precompute stripe indices
+                let mut primary_to_entries: HashMap<NodeId, Vec<(KVPair<K, V>, usize)>> =
+                    HashMap::new();
+                for pair in pairs {
+                    let primary = self.get_key_replicas(&pair.key)[0].clone();
+                    let stripe_idx = self.db.stripe_index(&pair.key);
+                    primary_to_entries
+                        .entry(primary)
+                        .or_default()
+                        .push((pair, stripe_idx));
+                }
+
+                let total_primaries = primary_to_entries.len();
+                let (vote_tx, mut vote_rx) = mpsc::channel(total_primaries);
+
+                // Prepare locally if this node is primary for any keys
+                if let Some(mut local_entries) = primary_to_entries.remove(&self.my_node_id) {
+                    // Sort by stripe index for deadlock prevention
+                    local_entries.sort_by_key(|(_, idx)| *idx);
+
+                    let mut guards: HashMap<usize, OwnedMutexGuard<HashMap<K, V>>> = HashMap::new();
+                    for (_, idx) in &local_entries {
+                        if !guards.contains_key(idx) {
+                            let stripe = self.db.get_stripe_by_index(*idx);
+                            guards.insert(*idx, stripe.lock_owned().await);
+                        }
+                    }
+
+                    self.pending_prepares.lock().await.insert(
+                        tx_id,
+                        PendingTx {
+                            pairs: local_entries,
+                            guards,
+                        },
+                    );
+
+                    // Local prepare always succeeds
+                    let _ = vote_tx.send(true).await;
+                }
+
+                // Send Prepare to remote primaries
+                let remote_primaries: Vec<NodeId> = primary_to_entries.keys().cloned().collect();
+                for (primary, entries) in &primary_to_entries {
+                    let pairs_only: Vec<KVPair<K, V>> =
+                        entries.iter().map(|(p, _)| p.clone()).collect();
+                    let msg = PeerMessage::Prepare {
+                        pairs: pairs_only,
+                        tx_id,
+                    };
+                    self.peers.send(primary, msg).await?;
+                }
+
+                // Register vote channel for remote votes
+                if !remote_primaries.is_empty() {
+                    self.awaiting_votes.lock().await.insert(tx_id, vote_tx);
+                }
+
+                // Clone everything the spawned task needs
+                let pending_prepares = self.pending_prepares.clone();
+                let awaiting_votes = self.awaiting_votes.clone();
+                let my_node_id = self.my_node_id.clone();
+                let cluster = self.cluster.clone();
+                let replication_degree = self.replication_degree;
+                let all_senders = self.peers.senders.clone();
+
+                // Spawn coordinator task to collect votes and commit/abort
+                tokio::spawn(async move {
+                    let mut all_prepared = true;
+                    for _ in 0..total_primaries {
+                        match vote_rx.recv().await {
+                            Some(true) => {}
+                            _ => {
+                                all_prepared = false;
+                                break;
+                            }
+                        }
+                    }
+
+                    awaiting_votes.lock().await.remove(&tx_id);
+
+                    if all_prepared {
+                        // Commit locally: write values and replicate
+                        {
+                            let mut pending = pending_prepares.lock().await;
+                            if let Some(mut tx) = pending.remove(&tx_id) {
+                                // Write into held guards
+                                for (pair, stripe_idx) in &tx.pairs {
+                                    if let Some(guard) = tx.guards.get_mut(stripe_idx) {
+                                        guard.insert(pair.key.clone(), pair.val.clone());
+                                    }
+                                }
+
+                                // Collect replication info before dropping guards
+                                let to_replicate: Vec<KVPair<K, V>> =
+                                    tx.pairs.iter().map(|(p, _)| p.clone()).collect();
+
+                                // Drop guards to release stripe locks
+                                drop(tx);
+                                drop(pending);
+
+                                // Send ReplicaPut for locally-owned pairs
+                                for pair in to_replicate {
+                                    let replicas = key_replica_indices(
+                                        &pair.key,
+                                        cluster.len(),
+                                        replication_degree,
+                                    );
+                                    for r_idx in replicas {
+                                        let replica = &cluster[r_idx];
+                                        if *replica != my_node_id {
+                                            if let Some(sender) = all_senders.get(replica) {
+                                                let msg =
+                                                    PeerMessage::ReplicaPut { pair: pair.clone() };
+                                                let _ = sender.send(msg).await;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Send Commit to remote primaries
+                        for primary in &remote_primaries {
+                            if let Some(sender) = all_senders.get(primary) {
+                                let msg = PeerMessage::Commit { tx_id };
+                                let _ = sender.send(msg).await;
+                            }
+                        }
+
+                        let _ = response_sender.send(true);
+                    } else {
+                        // Abort locally: just drop guards
+                        pending_prepares.lock().await.remove(&tx_id);
+
+                        // Send Abort to remote primaries
+                        for primary in &remote_primaries {
+                            if let Some(sender) = all_senders.get(primary) {
+                                let msg = PeerMessage::Abort { tx_id };
+                                let _ = sender.send(msg).await;
+                            }
+                        }
+
+                        let _ = response_sender.send(false);
+                    }
+                });
             }
         }
 
@@ -379,6 +565,79 @@ where
                         return Err(anyhow!("Receiver for req_id {} dropped", req_id));
                     }
                 };
+            }
+            PeerMessage::Abort { tx_id } => {
+                // Just drop the guards, releasing locks
+                self.pending_prepares.lock().await.remove(&tx_id);
+            }
+            // primary replica receives a prepare message from coordinator
+            PeerMessage::Prepare { pairs, tx_id } => {
+                // Compute stripe indices and sort for deadlock prevention
+                let mut entries: Vec<(KVPair<K, V>, usize)> = pairs
+                    .iter()
+                    .map(|p| (p.clone(), self.db.stripe_index(&p.key)))
+                    .collect();
+                entries.sort_by_key(|(_, idx)| *idx);
+
+                // Acquire stripe locks in sorted order
+                let mut guards: HashMap<usize, OwnedMutexGuard<HashMap<K, V>>> = HashMap::new();
+                for (_, idx) in &entries {
+                    if !guards.contains_key(idx) {
+                        let stripe = self.db.get_stripe_by_index(*idx);
+                        guards.insert(*idx, stripe.lock_owned().await);
+                    }
+                }
+
+                // Store pending transaction
+                self.pending_prepares.lock().await.insert(
+                    tx_id,
+                    PendingTx {
+                        pairs: entries,
+                        guards,
+                    },
+                );
+
+                // Vote prepared
+                let resp = PeerMessage::VotePrepared { tx_id };
+                self.peers.send(&from, resp).await?;
+            }
+            // Coordinator receives a prepare vote from a primary replica
+            PeerMessage::VotePrepared { tx_id } => {
+                let awaiting = self.awaiting_votes.lock().await;
+                if let Some(tx) = awaiting.get(&tx_id) {
+                    let _ = tx.send(true).await;
+                }
+            }
+            // primary replica can commit a txn
+            PeerMessage::Commit { tx_id } => {
+                let mut pending = self.pending_prepares.lock().await;
+                if let Some(mut tx) = pending.remove(&tx_id) {
+                    // Write values into held guards
+                    for (pair, stripe_idx) in &tx.pairs {
+                        if let Some(guard) = tx.guards.get_mut(stripe_idx) {
+                            guard.insert(pair.key.clone(), pair.val.clone());
+                        }
+                    }
+
+                    // Collect replication info before dropping
+                    let to_replicate: Vec<KVPair<K, V>> =
+                        tx.pairs.iter().map(|(p, _)| p.clone()).collect();
+
+                    // Release locks
+                    drop(tx);
+                    drop(pending);
+
+                    // Replicate to non-primary replicas
+                    for pair in to_replicate {
+                        let replicas = self.get_key_replicas(&pair.key);
+                        for replica in replicas {
+                            if *replica != self.my_node_id {
+                                let msg = PeerMessage::ReplicaPut { pair: pair.clone() };
+                                let _ = self.peers.send(replica, msg).await;
+                            }
+                        }
+                    }
+                }
             }
             // a peer has finished their test
             PeerMessage::Done => {

@@ -53,10 +53,16 @@ async fn main() -> Result<()> {
                         key,
                         response_sender,
                     };
+
                     if let Err(e) = sender.send(message).await {
-                        error!("Error sending get operation {e}");
+                        error!("Error sending operation {:?}: {e}", operation);
                     }
-                    response_receiver.await.unwrap();
+                    if let Err(e) = response_receiver.await {
+                        error!(
+                            "Error receiving response for operation {:?}: {e}",
+                            operation
+                        );
+                    }
                 }
                 Operation::Put { pair } => {
                     let (response_sender, response_receiver) = oneshot::channel();
@@ -64,33 +70,36 @@ async fn main() -> Result<()> {
                         pair,
                         response_sender,
                     };
-                    sender.send(message).await.unwrap();
-                    response_receiver.await.unwrap();
+
+                    if let Err(e) = sender.send(message).await {
+                        error!("Error sending operation {:?}: {e}", operation);
+                    }
+                    if let Err(e) = response_receiver.await {
+                        error!(
+                            "Error receiving response for operation {:?}: {e}",
+                            operation
+                        );
+                    }
                 }
                 Operation::TriPut { pairs } => {
-                    //todo!()
-                } // Operation::Get => {
-                  //     let (response_sender, response_receiver) = oneshot::channel();
-                  //     let message = LocalMessage::Get {
-                  //         key: data.key,
-                  //         response_sender,
-                  //     };
-                  //     if let Err(e) = sender.send(message).await {
-                  //         error!("Error sending get operation {e}");
-                  //     }
-                  //     response_receiver.await.unwrap();
-                  // }
-                  // Operation::Put => {
-                  //     let (response_sender, response_receiver) = oneshot::channel();
-                  //     let message = LocalMessage::Put {
-                  //         key: data.key,
-                  //         val: data.val,
-                  //         response_sender,
-                  //     };
-                  //     sender.send(message).await.unwrap();
-                  //     response_receiver.await.unwrap();
-                  // }
+                    let (response_sender, response_receiver) = oneshot::channel();
+                    let message = LocalMessage::TriPut {
+                        pairs,
+                        response_sender,
+                    };
+
+                    if let Err(e) = sender.send(message).await {
+                        error!("Error sending operation {:?}: {e}", operation);
+                    }
+                    if let Err(e) = response_receiver.await {
+                        error!(
+                            "Error receiving response for operation {:?}: {e}",
+                            operation
+                        );
+                    }
+                }
             }
+
             req_start.elapsed()
         }));
     }
@@ -157,6 +166,7 @@ fn generate_test_operations(num_operations: usize, key_range: u64) -> Vec<Operat
         .collect()
 }
 
+#[derive(Debug)]
 enum Operation {
     Get { key: u64 },
     Put { pair: KVPair<u64, u8> },

@@ -122,7 +122,7 @@ async fn main() -> Result<()> {
     let avg = latencies.iter().sum::<Duration>() / latencies.len() as u32;
     info!("Latency avg: {:?}, p50: {:?}, p99: {:?}", avg, p50, p99);
 
-    let _ = node_handle.await?;
+    node_handle.await?;
 
     // TODO: graceful, non-janky exit
     std::process::exit(0);

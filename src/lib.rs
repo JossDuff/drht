@@ -270,7 +270,7 @@ where
                 pair,
                 response_sender,
             } => {
-                let key = pair.key.clone();
+                let key = pair.key;
                 let val = pair.val.clone();
 
                 let replicas: Vec<NodeId> =
@@ -419,7 +419,7 @@ where
                                 // Write into held guards
                                 for (pair, stripe_idx) in &tx.pairs {
                                     if let Some(guard) = tx.guards.get_mut(stripe_idx) {
-                                        guard.insert(pair.key.clone(), pair.val.clone());
+                                        guard.insert(pair.key, pair.val.clone());
                                     }
                                 }
 
@@ -521,7 +521,7 @@ where
                     replicas.iter().filter(|x| **x != self.my_node_id).collect();
                 let req = PeerMessage::ReplicaPut { pair: pair.clone() };
                 for replica in other_replicas {
-                    let _ = self.peers.send(replica, req.clone()).await?;
+                    self.peers.send(replica, req.clone()).await?;
                 }
 
                 // respond to original peer that the put was successful
@@ -615,7 +615,7 @@ where
                     // Write values into held guards
                     for (pair, stripe_idx) in &tx.pairs {
                         if let Some(guard) = tx.guards.get_mut(stripe_idx) {
-                            guard.insert(pair.key.clone(), pair.val.clone());
+                            guard.insert(pair.key, pair.val.clone());
                         }
                     }
 

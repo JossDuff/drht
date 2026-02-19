@@ -25,6 +25,6 @@ pub struct Config {
     pub repication_degree: usize,
 
     /// How many locked sections in the database
-    #[arg(short, long, default_value = "100")]
+    #[arg(short, long, default_value = "256")]
     pub stripes: usize,
 }

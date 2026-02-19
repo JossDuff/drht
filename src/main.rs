@@ -84,6 +84,7 @@ async fn main() -> Result<()> {
                     }
                 }
                 Operation::TriPut { pairs } => {
+                    info!("Starting TriPut");
                     let tri_start = Instant::now();
                     let (response_sender, response_receiver) = oneshot::channel();
                     let message = LocalMessage::TriPut {

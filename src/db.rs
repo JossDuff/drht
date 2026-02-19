@@ -3,6 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+#[derive(Clone)]
 pub struct StripedDb<K, V> {
     stripes: Vec<Arc<Mutex<HashMap<K, V>>>>,
     num_stripes: usize,

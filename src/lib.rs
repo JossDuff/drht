@@ -30,8 +30,7 @@ where
     GetResponse { val: Option<V>, req_id: u64 },
     Put { pair: KVPair<K, V>, req_id: u64 },
     PutResponse { success: bool, req_id: u64 },
-    ReplicaPut { pair: KVPair<K, V>, req_id: u64 },
-    ReplicaPutAck { success: bool, req_id: u64 },
+    ReplicaPut { pair: KVPair<K, V> },
     Done,
 }
 
@@ -181,7 +180,7 @@ where
                 let owners = self.get_key_owners(&key);
 
                 // key is locally owned, immedietly respond
-                if self.is_owner(&key, self.replication_degree) {
+                if self.is_owner(&key) {
                     let resp = self.db.get(&key).await;
                     response_sender
                         .send(resp)
@@ -217,7 +216,6 @@ where
                     }
                 });
             }
-            // TODO: test the fire-and-forget method for sending puts to replicas
             LocalMessage::Put {
                 pair,
                 response_sender,
@@ -231,51 +229,34 @@ where
                 // TODO: should I insert after I hear back from all replicas?
                 guard.insert(key.clone(), val.clone());
 
-                // Collect remote owners (excluding self)
-                let remote_owners: Vec<NodeId> = self
-                    .get_key_owners(&key)
-                    .into_iter()
-                    .filter(|x| **x != self.my_node_id)
-                    .cloned()
-                    .collect();
+                // Collect
+                let replicas: Vec<NodeId> =
+                    self.get_key_owners(&key).into_iter().cloned().collect();
 
-                // there are no other owners of this key, we're done
-                if remote_owners.is_empty() {
-                    drop(guard);
-                    let _ = response_sender.send(true);
-                } else {
-                    // One channel per replica ack
-                    let (ack_tx, mut ack_rx) = mpsc::channel(remote_owners.len());
-                    let req_id: u64 = rand::rng().random();
-                    let expected = remote_owners.len();
+                // find the primary replica
+                let primary_replica = replicas
+                    .first()
+                    .ok_or(anyhow!("Key {:?} doesn't have any owners!", key))?;
 
-                    // Register ack sender so handle_peer_message can forward acks
-                    self.awaiting_replica_put_response
-                        .lock()
-                        .await
-                        .insert(req_id, ack_tx);
+                // if this node is the primary replica, execute the write and send the request to
+                // your other replicas
+                // Else, forward this request to the primary replica
+                if primary_replica == &self.my_node_id {
+                    // make the write and broadcast to the other replicas.  Don't need to wait for
+                    // a response because we assume no crashes
+                    self.db.put(key, val).await;
 
-                    // send put request to all replicas
-                    for owner in &remote_owners {
-                        let msg = PeerMessage::ReplicaPut {
-                            pair: pair.clone(),
-                            req_id,
-                        };
-                        self.peers.send(owner, msg).await?;
+                    let req = PeerMessage::ReplicaPut { pair };
+                    let other_replicas: Vec<&NodeId> =
+                        replicas.iter().filter(|x| **x != self.my_node_id).collect();
+                    for replica in other_replicas {
+                        self.peers.send(replica, req.clone()).await;
                     }
+                } else {
+                    // send this request to the primary replica and await the response
+                    // TODO why do we have to await the response.  It only fails on crash
 
-                    // Spawn task that holds the guard until all acks arrive
-                    tokio::spawn(async move {
-                        let mut received = 0;
-                        while received < expected {
-                            match ack_rx.recv().await {
-                                Some(_) => received += 1,
-                                None => break,
-                            }
-                        }
-                        drop(guard);
-                        let _ = response_sender.send(true);
-                    });
+                    todo!()
                 }
             }
             LocalMessage::TriPut {
@@ -413,7 +394,7 @@ where
     }
 
     // convience function
-    fn is_owner(&self, key: &K, replication_degree: usize) -> bool {
+    fn is_owner(&self, key: &K) -> bool {
         self.get_key_owners(key)
             .iter()
             .any(|id| **id == self.my_node_id)

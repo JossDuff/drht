@@ -42,7 +42,9 @@ async fn main() -> Result<()> {
     let start = Instant::now();
     let mut handles = Vec::with_capacity(test_data.len());
 
-    for operation in test_data {
+    for i in 0..test_data.len() {
+        print_progress(i, test_data.len());
+        let operation = test_data[i];
         let sender = sender.clone();
         handles.push(tokio::spawn(async move {
             let req_start = Instant::now();
@@ -82,6 +84,7 @@ async fn main() -> Result<()> {
                     }
                 }
                 Operation::TriPut { pairs } => {
+                    let tri_start = Instant::now();
                     let (response_sender, response_receiver) = oneshot::channel();
                     let message = LocalMessage::TriPut {
                         pairs,
@@ -97,6 +100,8 @@ async fn main() -> Result<()> {
                             operation
                         );
                     }
+                    let tri_end_ms = tri_start.elapsed().as_millis();
+                    info!("TriPut took {}ms", tri_end_ms);
                 }
             }
 
@@ -166,9 +171,16 @@ fn generate_test_operations(num_operations: usize, key_range: u64) -> Vec<Operat
         .collect()
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum Operation {
     Get { key: u64 },
     Put { pair: KVPair<u64, u8> },
     TriPut { pairs: [KVPair<u64, u8>; 3] },
+}
+
+fn print_progress(i: usize, total: usize) {
+    let step = total / 10;
+    if step > 0 && i % step == 0 {
+        info!("{}% complete", (i * 100) / total);
+    }
 }

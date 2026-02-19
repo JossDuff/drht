@@ -26,11 +26,26 @@ where
     V: Clone,
     K: Clone,
 {
+    // asking a primary replica for a get
     Get { key: K, req_id: u64 },
+    // primary replica responding to a get request
     GetResponse { val: Option<V>, req_id: u64 },
+    // asking a primary replica for a put
     Put { pair: KVPair<K, V>, req_id: u64 },
+    // primary replica responding to a put request
     PutResponse { success: bool, req_id: u64 },
+    // message from a primary replica to process a put
     ReplicaPut { pair: KVPair<K, V> },
+    // 2PC messages:
+    // Coordinator asking primary replicas to ready for a PUT
+    Prepare { pair: KVPair<K, V>, req_id: u64 },
+    // Primary replica responding to coordinator saying they're ready to commit
+    VotePrepared { req_id: u64 },
+    // After coordinator has heard back from all nodes, broadcast to all primary replicas
+    // Primary replicas either commit or abort the PUT
+    Commit { req_id: u64 },
+    Abort { req_id: u64 },
+    // This node has finished its tests
     Done,
 }
 
@@ -40,8 +55,8 @@ where
     V: Clone,
     K: Clone,
 {
-    key: K,
-    val: V,
+    pub key: K,
+    pub val: V,
 }
 
 #[derive(Debug)]

@@ -1,12 +1,13 @@
 use anyhow::Result;
 use clap::Parser;
+use dht::KVPair;
 use dht::{Config, LocalMessage, Node};
 use rand::Rng;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use tracing::{error, info};
 
-#[tokio::main(worker_threads = 3)]
+#[tokio::main(worker_threads = 4)]
 async fn main() -> Result<()> {
     // init logger
     tracing_subscriber::fmt::init();
@@ -47,19 +48,26 @@ async fn main() -> Result<()> {
             let req_start = Instant::now();
             match operation {
                 Operation::Get { key } => {
-                    //todo!()
+                    let (response_sender, response_receiver) = oneshot::channel();
+                    let message = LocalMessage::Get {
+                        key,
+                        response_sender,
+                    };
+                    if let Err(e) = sender.send(message).await {
+                        error!("Error sending get operation {e}");
+                    }
+                    response_receiver.await.unwrap();
                 }
-                Operation::Put { key, val } => {
-                    //todo!()
+                Operation::Put { pair } => {
+                    let (response_sender, response_receiver) = oneshot::channel();
+                    let message = LocalMessage::Put {
+                        pair,
+                        response_sender,
+                    };
+                    sender.send(message).await.unwrap();
+                    response_receiver.await.unwrap();
                 }
-                Operation::TriPut {
-                    key_1,
-                    val_1,
-                    key_2,
-                    val_2,
-                    key_3,
-                    val_3,
-                } => {
+                Operation::TriPut { pairs } => {
                     //todo!()
                 } // Operation::Get => {
                   //     let (response_sender, response_receiver) = oneshot::channel();
@@ -119,17 +127,27 @@ fn generate_test_operations(num_operations: usize, key_range: u64) -> Vec<Operat
         .map(|_| match rng.random_range(0..10) {
             // range 0 or 1 (20%)
             0..=1 => Operation::Put {
-                key: rng.random_range(0..key_range),
-                val: rng.random(),
+                pair: KVPair {
+                    key: rng.random_range(0..key_range),
+                    val: rng.random(),
+                },
             },
             // range 2 or 3 (20%)
             2..=3 => Operation::TriPut {
-                key_1: rng.random_range(0..key_range),
-                val_1: rng.random(),
-                key_2: rng.random_range(0..key_range),
-                val_2: rng.random(),
-                key_3: rng.random_range(0..key_range),
-                val_3: rng.random(),
+                pairs: [
+                    KVPair {
+                        key: rng.random_range(0..key_range),
+                        val: rng.random(),
+                    },
+                    KVPair {
+                        key: rng.random_range(0..key_range),
+                        val: rng.random(),
+                    },
+                    KVPair {
+                        key: rng.random_range(0..key_range),
+                        val: rng.random(),
+                    },
+                ],
             },
             // range 4..9 (60%)
             _ => Operation::Get {
@@ -141,6 +159,6 @@ fn generate_test_operations(num_operations: usize, key_range: u64) -> Vec<Operat
 
 enum Operation {
     Get { key: u64 },
-    Put { pair: KVPair },
-    TriPut { pairs: [KVPair; 3] },
+    Put { pair: KVPair<u64, u8> },
+    TriPut { pairs: [KVPair<u64, u8>; 3] },
 }

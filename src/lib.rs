@@ -92,7 +92,6 @@ where
     local_inbox: mpsc::Receiver<LocalMessage<K, V>>,
     db: StripedDb<K, V>,
     awaiting_put_response: Arc<Mutex<HashMap<u64, oneshot::Sender<bool>>>>,
-    awaiting_replica_put_response: Arc<Mutex<HashMap<u64, mpsc::Sender<bool>>>>,
     awaiting_get_response: Arc<Mutex<HashMap<u64, oneshot::Sender<Option<V>>>>>,
 }
 
@@ -114,8 +113,6 @@ where
     pub async fn new(config: Config) -> Result<(Self, mpsc::Sender<LocalMessage<K, V>>)> {
         let db = StripedDb::new(config.stripes);
         let awaiting_put_response: Arc<Mutex<HashMap<u64, oneshot::Sender<bool>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        let awaiting_replica_put_response: Arc<Mutex<HashMap<u64, mpsc::Sender<bool>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let awaiting_get_response: Arc<Mutex<HashMap<u64, oneshot::Sender<Option<V>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -139,7 +136,6 @@ where
                 replication_degree: config.repication_degree,
                 awaiting_get_response,
                 awaiting_put_response,
-                awaiting_replica_put_response,
                 db,
             },
             local_sender,
@@ -173,29 +169,31 @@ where
     // handles messages from the test harness and from the network loop when peers respond
     async fn handle_local_message(&self, msg: LocalMessage<K, V>) -> Result<()> {
         match msg {
+            // sends GET request to the primary replica
             LocalMessage::Get {
                 key,
                 response_sender,
             } => {
-                let owners = self.get_key_owners(&key);
+                let replicas = self.get_key_replicas(&key);
 
-                // key is locally owned, immedietly respond
-                if self.is_owner(&key) {
+                // find the primary replica
+                let primary_replica = replicas
+                    .first()
+                    .ok_or(anyhow!("Key {:?} doesn't have any replicas!", key))?;
+
+                // if this replica is the primary, process the GET
+                if **primary_replica == self.my_node_id {
                     let resp = self.db.get(&key).await;
                     response_sender
                         .send(resp)
                         .map_err(|_| anyhow!("Receiver for local get on key {:?} dropped", key))?;
                     return Ok(());
+                } else {
                 }
-
-                // just request one of the key's owners (assume replication is correct)
-                let key_owner = owners
-                    .first()
-                    .ok_or(anyhow!("No owner found for key {:?}", key))?;
 
                 let req_id: u64 = rand::rng().random();
                 let request: PeerMessage<K, V> = PeerMessage::Get { key, req_id };
-                self.peers.send(key_owner, request).await?;
+                self.peers.send(primary_replica, request).await?;
 
                 // create a task awaiting the response from a peer
                 let mut awaiting_get_response = self.awaiting_get_response.lock().await;
@@ -223,20 +221,13 @@ where
                 let key = pair.key.clone();
                 let val = pair.val.clone();
 
-                // In handle_local_message for Put:
-                let stripe = self.db.get_stripe(&key);
-                let mut guard = stripe.lock_owned().await;
-                // TODO: should I insert after I hear back from all replicas?
-                guard.insert(key.clone(), val.clone());
-
-                // Collect
                 let replicas: Vec<NodeId> =
-                    self.get_key_owners(&key).into_iter().cloned().collect();
+                    self.get_key_replicas(&key).into_iter().cloned().collect();
 
                 // find the primary replica
                 let primary_replica = replicas
                     .first()
-                    .ok_or(anyhow!("Key {:?} doesn't have any owners!", key))?;
+                    .ok_or(anyhow!("Key {:?} doesn't have any replicas!", key))?;
 
                 // if this node is the primary replica, execute the write and send the request to
                 // your other replicas
@@ -254,9 +245,29 @@ where
                     }
                 } else {
                     // send this request to the primary replica and await the response
-                    // TODO why do we have to await the response.  It only fails on crash
+                    // TODO why do we have to await the response?  It only fails on crash
+                    let req_id: u64 = rand::rng().random();
+                    let req = PeerMessage::Put { pair, req_id };
+                    self.peers.send(primary_replica, req).await?;
 
-                    todo!()
+                    // create a task awaiting the response from a peer
+                    let mut awaiting_put_response = self.awaiting_put_response.lock().await;
+                    let (put_sender, put_receiver) = oneshot::channel();
+                    awaiting_put_response.insert(req_id, put_sender);
+
+                    // start a non-blocking task that awaits this response and sends back to test
+                    // harness
+                    tokio::spawn(async move {
+                        match put_receiver.await {
+                            Ok(peer_put_response) => {
+                                // send get response back to test harness
+                                let _ = response_sender.send(peer_put_response);
+                            }
+                            Err(e) => {
+                                error!("Receive error waiting for putResponse: {}", e);
+                            }
+                        }
+                    });
                 }
             }
             LocalMessage::TriPut {
@@ -292,25 +303,31 @@ where
                     from, key, req_id
                 );
             }
-            // peer is asking us for a put request
+            // peer is asking us for a put request because we are the primary replica
             PeerMessage::Put { pair, req_id } => {
                 let key = pair.key;
-                let val = pair.val;
+                let val = pair.val.clone();
                 let result = self.db.put(key, val).await;
                 let resp: PeerMessage<K, V> = PeerMessage::PutResponse {
                     success: result,
                     req_id,
                 };
 
+                // broadcast this put to other replicas
+                let replicas: Vec<NodeId> =
+                    self.get_key_replicas(&key).into_iter().cloned().collect();
+                let other_replicas: Vec<&NodeId> =
+                    replicas.iter().filter(|x| **x != self.my_node_id).collect();
+                let req = PeerMessage::ReplicaPut { pair: pair.clone() };
+                for replica in other_replicas {
+                    let _ = self.peers.send(replica, req.clone()).await?;
+                }
+
+                // respond to original peer that the put was successful
                 self.peers
                     .send(&from, resp)
                     .await
                     .map_err(|e| anyhow!("Error sending PutResponse to node {}: {}", from, e))?;
-
-                debug!(
-                    "Sent PutResponse to {} for key {:?} req_id {}",
-                    from, key, req_id
-                );
             }
             // received a response from a peer about a previous get request
             PeerMessage::GetResponse { val, req_id } => {
@@ -344,32 +361,9 @@ where
                     }
                 };
             }
-            PeerMessage::ReplicaPut { pair, req_id } => {
-                let result = self.db.put(pair.key, pair.val).await;
-                let resp = PeerMessage::ReplicaPutAck {
-                    success: result,
-                    req_id,
-                };
-                self.peers
-                    .send(&from, resp)
-                    .await
-                    .map_err(|e| anyhow!("Error sending ReplicaPutAck to node {}: {}", from, e))?;
-            }
-            // collect acks from replicas that a put was successful
-            PeerMessage::ReplicaPutAck { success, req_id } => {
-                let mut awaiting_replica_put_response =
-                    self.awaiting_replica_put_response.lock().await;
-                // send to task waiting for n acks before dropping lock
-                match awaiting_replica_put_response.remove(&req_id) {
-                    Some(sender) => {
-                        sender.send(success).await.map_err(|_| {
-                            anyhow!("Error sending ReplicaPutAck for request {}", req_id)
-                        })?;
-                    }
-                    None => {
-                        return Err(anyhow!("Receiver for req_id {} dropped", req_id));
-                    }
-                };
+            // the primary replica is telling us to execute this put
+            PeerMessage::ReplicaPut { pair } => {
+                self.db.put(pair.key, pair.val).await;
             }
             // a peer has finished their test
             PeerMessage::Done => {
@@ -385,26 +379,19 @@ where
         Ok(false)
     }
 
-    // maps the key to the owner nodes
-    fn get_key_owners(&self, key: &K) -> Vec<&NodeId> {
-        key_owner_indices(key, self.cluster.len(), self.replication_degree)
+    // maps the key to the replica nodes
+    fn get_key_replicas(&self, key: &K) -> Vec<&NodeId> {
+        key_replica_indices(key, self.cluster.len(), self.replication_degree)
             .into_iter()
             .map(|i| &self.cluster[i])
             .collect()
-    }
-
-    // convience function
-    fn is_owner(&self, key: &K) -> bool {
-        self.get_key_owners(key)
-            .iter()
-            .any(|id| **id == self.my_node_id)
     }
 }
 
 // Pure function: given a sorted cluster and replication degree, return the
 // indices of nodes that own this key.
 // Separated for testing logic
-fn key_owner_indices<K: Hash>(
+fn key_replica_indices<K: Hash>(
     key: &K,
     cluster_len: usize,
     replication_degree: usize,
@@ -435,12 +422,12 @@ mod tests {
     }
 
     #[test]
-    fn single_owner_returns_one_node() {
+    fn single_replica_returns_one_node() {
         let cluster = make_cluster(5);
         let key: u64 = 42;
-        let owners = key_owner_indices(&key, cluster.len(), 1);
-        assert_eq!(owners.len(), 1);
-        assert!(owners[0] < cluster.len());
+        let replicas = key_replica_indices(&key, cluster.len(), 1);
+        assert_eq!(replicas.len(), 1);
+        assert!(replicas[0] < cluster.len());
     }
 
     #[test]
@@ -449,32 +436,32 @@ mod tests {
         let key: u64 = 42;
 
         for degree in 1..=5 {
-            let owners = key_owner_indices(&key, cluster.len(), degree);
-            assert_eq!(owners.len(), degree);
+            let replicas = key_replica_indices(&key, cluster.len(), degree);
+            assert_eq!(replicas.len(), degree);
         }
     }
 
     #[test]
-    fn no_duplicate_owners() {
+    fn no_duplicate_replicas() {
         let cluster = make_cluster(5);
         let key: u64 = 99;
-        let owners = key_owner_indices(&key, cluster.len(), 5);
+        let replicas = key_replica_indices(&key, cluster.len(), 5);
 
-        let mut unique = owners.clone();
+        let mut unique = replicas.clone();
         unique.sort();
         unique.dedup();
-        assert_eq!(unique.len(), owners.len());
+        assert_eq!(unique.len(), replicas.len());
     }
 
     #[test]
-    fn owners_are_contiguous_on_ring() {
+    fn replicas_are_contiguous_on_ring() {
         let cluster = make_cluster(5);
         let key: u64 = 7;
-        let owners = key_owner_indices(&key, cluster.len(), 3);
+        let replicas = key_replica_indices(&key, cluster.len(), 3);
 
-        // each subsequent owner should be (prev + 1) % cluster_len
-        for i in 1..owners.len() {
-            assert_eq!(owners[i], (owners[i - 1] + 1) % cluster.len());
+        // each subsequent replica should be (prev + 1) % cluster_len
+        for i in 1..replicas.len() {
+            assert_eq!(replicas[i], (replicas[i - 1] + 1) % cluster.len());
         }
     }
 
@@ -483,16 +470,16 @@ mod tests {
         let cluster = make_cluster(3);
         let key: u64 = 55;
         // request degree 10 but only 3 nodes exist
-        let owners = key_owner_indices(&key, cluster.len(), 10);
-        assert_eq!(owners.len(), 3);
+        let replicas = key_replica_indices(&key, cluster.len(), 10);
+        assert_eq!(replicas.len(), 3);
     }
 
     #[test]
-    fn same_key_same_owners() {
+    fn same_key_same_replicas() {
         let cluster = make_cluster(5);
         let key: u64 = 123;
-        let a = key_owner_indices(&key, cluster.len(), 2);
-        let b = key_owner_indices(&key, cluster.len(), 2);
+        let a = key_replica_indices(&key, cluster.len(), 2);
+        let b = key_replica_indices(&key, cluster.len(), 2);
         assert_eq!(a, b);
     }
 
@@ -503,8 +490,8 @@ mod tests {
 
         // hash a bunch of keys and count which node is primary
         for key in 0u64..1000 {
-            let owners = key_owner_indices(&key, cluster.len(), 1);
-            primary_counts[owners[0]] += 1;
+            let replicas = key_replica_indices(&key, cluster.len(), 1);
+            primary_counts[replicas[0]] += 1;
         }
 
         // every node should get at least some keys (sanity check distribution)
@@ -524,14 +511,14 @@ mod tests {
         // find a key whose primary is the last node
         let key = (0u64..10000)
             .find(|k| {
-                let owners = key_owner_indices(k, cluster.len(), 1);
-                owners[0] == cluster.len() - 1
+                let replicas = key_replica_indices(k, cluster.len(), 1);
+                replicas[0] == cluster.len() - 1
             })
             .expect("should find a key mapping to last node");
 
-        let owners = key_owner_indices(&key, cluster.len(), 3);
-        assert_eq!(owners[0], cluster.len() - 1);
-        assert_eq!(owners[1], 0); // wraps to first node
-        assert_eq!(owners[2], 1);
+        let replicas = key_replica_indices(&key, cluster.len(), 3);
+        assert_eq!(replicas[0], cluster.len() - 1);
+        assert_eq!(replicas[1], 0); // wraps to first node
+        assert_eq!(replicas[2], 1);
     }
 }

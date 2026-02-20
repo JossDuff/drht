@@ -22,7 +22,6 @@ use tokio::sync::OwnedMutexGuard;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, error, info};
 
-const PREPARE_LOCK_TIMEOUT: Duration = Duration::from_millis(50);
 const COORDINATOR_VOTE_TIMEOUT: Duration = Duration::from_millis(200);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -382,17 +381,12 @@ where
                         for (_, idx) in &local_entries {
                             if !guards.contains_key(idx) {
                                 let stripe = db.get_stripe_by_index(*idx);
-                                match tokio::time::timeout(
-                                    PREPARE_LOCK_TIMEOUT,
-                                    stripe.lock_owned(),
-                                )
-                                .await
-                                {
+                                match stripe.try_lock_owned() {
                                     Ok(guard) => {
                                         guards.insert(*idx, guard);
                                     }
                                     Err(_) => {
-                                        debug!("Local prepare lock timeout for tx {}", tx_id);
+                                        debug!("Local prepare try_lock failed for tx {}", tx_id);
                                         lock_failed = true;
                                         break;
                                     }
@@ -650,21 +644,19 @@ where
                         .collect();
                     entries.sort_by_key(|(_, idx)| *idx);
 
-                    // Acquire stripe locks in sorted order with timeout
+                    // Try to acquire stripe locks in sorted order
                     let mut guards: HashMap<usize, OwnedMutexGuard<HashMap<K, V>>> = HashMap::new();
                     let mut lock_failed = false;
                     for (_, idx) in &entries {
                         if !guards.contains_key(idx) {
                             let stripe = db.get_stripe_by_index(*idx);
-                            match tokio::time::timeout(PREPARE_LOCK_TIMEOUT, stripe.lock_owned())
-                                .await
-                            {
+                            match stripe.try_lock_owned() {
                                 Ok(guard) => {
                                     guards.insert(*idx, guard);
                                 }
                                 Err(_) => {
                                     debug!(
-                                        "Prepare lock timeout for tx {} on stripe {}",
+                                        "Prepare try_lock failed for tx {} on stripe {}",
                                         tx_id, idx
                                     );
                                     lock_failed = true;

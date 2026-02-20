@@ -22,6 +22,7 @@ use tokio::sync::OwnedMutexGuard;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, error, info};
 
+const CHANNEL_BUFFER_SIZE: usize = 4;
 const COORDINATOR_VOTE_TIMEOUT: Duration = Duration::from_millis(200);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -183,7 +184,7 @@ where
             connect_all::<K, V>(&config.name, &config.connections).await?;
 
         // for sending/ receiving messages from the test harness
-        let (local_sender, local_inbox) = mpsc::channel(64);
+        let (local_sender, local_inbox) = mpsc::channel(CHANNEL_BUFFER_SIZE);
 
         let done_count = AtomicUsize::new(0);
 

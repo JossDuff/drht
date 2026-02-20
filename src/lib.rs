@@ -109,6 +109,8 @@ where
         pairs: [KVPair<K, V>; 3],
         response_sender: oneshot::Sender<bool>,
     },
+    // message from test harness when all tests finish
+    Done,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq, PartialOrd, Hash)]
@@ -524,6 +526,15 @@ where
                         let _ = response_sender.send(false);
                     }
                 });
+            }
+            // tell other peers that I'm done with my tests
+            LocalMessage::Done => {
+                let my_node_id = self.my_node_id.clone();
+                for (node_id, sender) in self.peers.senders.iter() {
+                    if *node_id != my_node_id {
+                        let _ = sender.send(PeerMessage::Done).await;
+                    }
+                }
             }
         }
 

@@ -115,8 +115,11 @@ async fn main() -> Result<()> {
     for handle in handles {
         latencies.push(handle.await?);
     }
-
     let elapsed = start.elapsed();
+
+    // Signal peers we're done
+    sender.send(LocalMessage::Done).await?;
+
     info!("Completed {} operations in {:?}", num_keys, elapsed);
     info!(
         "Throughput: {:.2} ops/sec",

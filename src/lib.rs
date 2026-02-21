@@ -19,7 +19,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::OwnedMutexGuard;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use tracing::{debug, error, info};
 
 const CHANNEL_BUFFER_SIZE: usize = 4;
@@ -130,27 +130,74 @@ struct PendingTx<K: Clone, V: Clone> {
     guards: HashMap<usize, OwnedMutexGuard<HashMap<K, V>>>,
 }
 
+// Shared state accessible by both tasks: local message handler and peer message handler
+struct Shared<K: Clone, V: Clone> {
+    senders: HashMap<NodeId, mpsc::Sender<PeerMessage<K, V>>>,
+    cluster: Vec<NodeId>,
+    my_node_id: NodeId,
+    replication_degree: usize,
+    db: StripedDb<K, V>,
+    awaiting_put_response: Arc<Mutex<HashMap<u64, oneshot::Sender<bool>>>>,
+    awaiting_get_response: Arc<Mutex<HashMap<u64, oneshot::Sender<Option<V>>>>>,
+    pending_prepares: Arc<Mutex<HashMap<u64, PendingTx<K, V>>>>,
+    awaiting_votes: Arc<Mutex<HashMap<u64, mpsc::Sender<bool>>>>,
+    done_count: AtomicUsize,
+    // signaled when done_count reaches cluster.len()
+    shutdown: Notify,
+}
+
+impl<K, V> Shared<K, V>
+where
+    K: Send
+        + Sync
+        + 'static
+        + Debug
+        + Serialize
+        + for<'de> Deserialize<'de>
+        + Hash
+        + Eq
+        + PartialEq
+        + Clone
+        + Copy,
+    V: Send + Sync + 'static + Debug + Serialize + for<'de> Deserialize<'de> + Clone,
+{
+    // Increment done_count and signal shutdown if all nodes are done.
+    fn mark_done(&self) {
+        let count = self.done_count.fetch_add(1, Ordering::SeqCst) + 1;
+        if count >= self.cluster.len() {
+            self.shutdown.notify_waiters();
+        }
+    }
+
+    fn get_key_replicas(&self, key: &K) -> Vec<&NodeId> {
+        key_replica_indices(key, self.cluster.len(), self.replication_degree)
+            .into_iter()
+            .map(|i| &self.cluster[i])
+            .collect()
+    }
+
+    // Send a message to a peer.  Awaits until the bounded channel has space.
+    // This is fine because each task has its own receiver — a blocked send
+    // here can never prevent the *other* task from draining its inbox.
+    async fn send_to_peer(&self, target: &NodeId, msg: PeerMessage<K, V>) -> Result<()> {
+        if let Some(sender) = self.senders.get(target) {
+            sender
+                .send(msg)
+                .await
+                .map_err(|_| anyhow!("Channel to {} closed", target))?;
+        }
+        Ok(())
+    }
+}
+
 pub struct Node<K, V>
 where
     V: Clone,
     K: Clone,
 {
-    peers: Peers<K, V>,
-    // all the nodes in this cluster, in consistent ordering
-    cluster: Vec<NodeId>,
-    // number of nodes that have finished their test
-    done_count: AtomicUsize,
-    // how many nodes hold each key
-    replication_degree: usize,
-    my_node_id: NodeId,
+    shared: Arc<Shared<K, V>>,
     local_inbox: mpsc::Receiver<LocalMessage<K, V>>,
-    db: StripedDb<K, V>,
-    awaiting_put_response: Arc<Mutex<HashMap<u64, oneshot::Sender<bool>>>>,
-    awaiting_get_response: Arc<Mutex<HashMap<u64, oneshot::Sender<Option<V>>>>>,
-    // Participant: holds locks between Prepare and Commit/Abort
-    pending_prepares: Arc<Mutex<HashMap<u64, PendingTx<K, V>>>>,
-    // Coordinator: channels for collecting votes
-    awaiting_votes: Arc<Mutex<HashMap<u64, mpsc::Sender<bool>>>>,
+    peer_inbox: mpsc::Receiver<(NodeId, PeerMessage<K, V>)>,
 }
 
 impl<K, V> Node<K, V>
@@ -186,72 +233,97 @@ where
         // for sending/ receiving messages from the test harness
         let (local_sender, local_inbox) = mpsc::channel(CHANNEL_BUFFER_SIZE);
 
-        let done_count = AtomicUsize::new(0);
+        // Destructure Peers so we can give the inbox to one task and
+        // the senders map to the shared state.
+        let peer_inbox = peers.inbox;
+        let senders = peers.senders;
+
+        let shared = Arc::new(Shared {
+            senders,
+            cluster,
+            my_node_id,
+            replication_degree: config.repication_degree,
+            db,
+            awaiting_get_response,
+            awaiting_put_response,
+            pending_prepares,
+            awaiting_votes,
+            done_count: AtomicUsize::new(0),
+            shutdown: Notify::new(),
+        });
 
         Ok((
             Self {
-                peers,
-                cluster,
-                done_count,
-                my_node_id,
+                shared,
                 local_inbox,
-                replication_degree: config.repication_degree,
-                awaiting_get_response,
-                awaiting_put_response,
-                pending_prepares,
-                awaiting_votes,
-                db,
+                peer_inbox,
             },
             local_sender,
         ))
     }
 
-    pub async fn run(&mut self) -> Result<()> {
-        loop {
-            // using tokio select because we expect to be io bound, not cpu bound
-            // TODO: make these two separate tasks
-            tokio::select! {
-                Some(local_msg) = self.local_inbox.recv() => {
-                    if self.handle_local_message(local_msg).await? {
-                        info!("All peers done, shutting down");
-                        break;
-                    }
-                }
-                Some((from, peer_msg)) = self.peers.inbox.recv() => {
-                    // returns true when all peers are done
-                    if self.handle_peer_message(from, peer_msg).await? {
-                        info!("All peers done, shutting down");
-                        break;
-                    }
-                }
-                else => {
-                    info!("All channels closed");
-                    break;
-                }
-            }
-        }
+    // Split into two independent tasks, each with its own receiver.
+    //
+    // The local task can freely `.await` on sends to peers without blocking
+    // the peer task from draining its inbox
+    pub async fn run(self) -> Result<()> {
+        let shared_local = self.shared.clone();
+        let shared_peer = self.shared.clone();
+        let shutdown = self.shared.clone();
+
+        let local_handle = tokio::spawn(run_local_loop(shared_local, self.local_inbox));
+        let peer_handle = tokio::spawn(run_peer_loop(shared_peer, self.peer_inbox));
+
+        // Wait for shutdown signal (done_count >= cluster.len())
+        shutdown.shutdown.notified().await;
+        info!("All peers done, shutting down");
+
+        // Cancel both loops.  We don't strictly need to abort
+        local_handle.abort();
+        peer_handle.abort();
+
+        // Swallow JoinErrors from the aborts
+        let _ = local_handle.await;
+        let _ = peer_handle.await;
+
         Ok(())
     }
+}
 
-    // handles messages from the test harness and from the network loop when peers respond
-    async fn handle_local_message(&self, msg: LocalMessage<K, V>) -> Result<bool> {
+async fn run_local_loop<K, V>(
+    s: Arc<Shared<K, V>>,
+    mut inbox: mpsc::Receiver<LocalMessage<K, V>>,
+) -> Result<()>
+where
+    K: Send
+        + Sync
+        + 'static
+        + Debug
+        + Serialize
+        + for<'de> Deserialize<'de>
+        + Hash
+        + Eq
+        + PartialEq
+        + Clone
+        + Copy,
+    V: Send + Sync + 'static + Debug + Serialize + for<'de> Deserialize<'de> + Clone,
+{
+    while let Some(msg) = inbox.recv().await {
         debug!("Got {:?}", msg);
         match msg {
-            // sends GET request to the primary replica
             LocalMessage::Get {
                 key,
                 response_sender,
             } => {
-                let replicas = self.get_key_replicas(&key);
-
-                // find the primary replica
+                let replicas = s.get_key_replicas(&key);
                 let primary_replica = replicas
                     .first()
-                    .ok_or(anyhow!("Key {:?} doesn't have any replicas!", key))?;
+                    .ok_or(anyhow!("Key {:?} doesn't have any replicas!", key))?
+                    .clone()
+                    .clone();
 
-                // if this replica is the primary, process the GET
-                if **primary_replica == self.my_node_id {
-                    let db = self.db.clone();
+                if primary_replica == s.my_node_id {
+                    let db = s.db.clone();
                     tokio::spawn(async move {
                         let resp = db.get(&key).await;
                         let _ = response_sender.send(resp);
@@ -259,21 +331,21 @@ where
                 } else {
                     let req_id: u64 = rand::rng().random();
                     let request: PeerMessage<K, V> = PeerMessage::Get { key, req_id };
-                    self.peers.send(primary_replica, request).await?;
 
-                    // create a task awaiting the response from a peer
+                    // Register the response channel BEFORE sending so there's
+                    // no race with the reply arriving first.
                     let (get_sender, get_receiver) = oneshot::channel();
                     {
-                        let mut awaiting_get_response = self.awaiting_get_response.lock().await;
-                        awaiting_get_response.insert(req_id, get_sender);
+                        let mut awaiting = s.awaiting_get_response.lock().await;
+                        awaiting.insert(req_id, get_sender);
                     }
 
-                    // start a non-blocking task that awaits this response and sends back to test
-                    // harness
+                    // This .await may block if the peer's channel is full.
+                    s.send_to_peer(&primary_replica, request).await?;
+
                     tokio::spawn(async move {
                         match get_receiver.await {
                             Ok(peer_get_response) => {
-                                // send get response back to test harness
                                 let _ = response_sender.send(peer_get_response);
                             }
                             Err(e) => {
@@ -290,56 +362,43 @@ where
                 let key = pair.key;
                 let val = pair.val.clone();
 
-                let replicas: Vec<NodeId> =
-                    self.get_key_replicas(&key).into_iter().cloned().collect();
-
-                // find the primary replica
+                let replicas: Vec<NodeId> = s.get_key_replicas(&key).into_iter().cloned().collect();
                 let primary_replica = replicas
                     .first()
                     .ok_or(anyhow!("Key {:?} doesn't have any replicas!", key))?
                     .clone();
 
-                // if this node is the primary replica, execute the write and send the request to
-                // your other replicas
-                // Else, forward this request to the primary replica
-                if primary_replica == self.my_node_id {
-                    // make the write and broadcast to the other replicas.  Don't need to wait for
-                    // a response because we assume no crashes
-                    let db = self.db.clone();
-                    let my_node_id = self.my_node_id.clone();
-                    let all_senders = self.peers.senders.clone();
+                if primary_replica == s.my_node_id {
+                    let db = s.db.clone();
+                    let my_node_id = s.my_node_id.clone();
+                    let senders = s.senders.clone();
                     tokio::spawn(async move {
                         db.put(key, val).await;
-                        // respond to test harness
                         let _ = response_sender.send(true);
 
                         let req = PeerMessage::ReplicaPut { pair };
                         for replica in replicas.iter().filter(|x| **x != my_node_id) {
-                            if let Some(sender) = all_senders.get(replica) {
+                            if let Some(sender) = senders.get(replica) {
                                 let _ = sender.send(req.clone()).await;
                             }
                         }
                     });
                 } else {
-                    // send this request to the primary replica and await the response
-                    // TODO why do we have to await the response?  It only fails on crash
                     let req_id: u64 = rand::rng().random();
                     let req = PeerMessage::Put { pair, req_id };
-                    self.peers.send(&primary_replica, req).await?;
 
-                    // create a task awaiting the response from a peer
+                    // Register BEFORE sending
                     let (put_sender, put_receiver) = oneshot::channel();
                     {
-                        let mut awaiting_put_response = self.awaiting_put_response.lock().await;
-                        awaiting_put_response.insert(req_id, put_sender);
+                        let mut awaiting = s.awaiting_put_response.lock().await;
+                        awaiting.insert(req_id, put_sender);
                     }
 
-                    // start a non-blocking task that awaits the response from the primary and sends back to test
-                    // harness
+                    s.send_to_peer(&primary_replica, req).await?;
+
                     tokio::spawn(async move {
                         match put_receiver.await {
                             Ok(peer_put_response) => {
-                                // send get response back to test harness
                                 let _ = response_sender.send(peer_put_response);
                             }
                             Err(e) => {
@@ -349,7 +408,7 @@ where
                     });
                 }
             }
-            // This node serves as the coordinator
+            // This node is the coordinator for the TRIPUT
             LocalMessage::TriPut {
                 pairs,
                 response_sender,
@@ -360,8 +419,8 @@ where
                 let mut primary_to_entries: HashMap<NodeId, Vec<(KVPair<K, V>, usize)>> =
                     HashMap::new();
                 for pair in pairs {
-                    let primary = self.get_key_replicas(&pair.key)[0].clone();
-                    let stripe_idx = self.db.stripe_index(&pair.key);
+                    let primary = s.get_key_replicas(&pair.key)[0].clone();
+                    let stripe_idx = s.db.stripe_index(&pair.key);
                     primary_to_entries
                         .entry(primary)
                         .or_default()
@@ -372,12 +431,11 @@ where
                 let (vote_tx, mut vote_rx) = mpsc::channel(total_primaries);
 
                 // Prepare locally if this node is primary for any keys
-                if let Some(mut local_entries) = primary_to_entries.remove(&self.my_node_id) {
-                    let db = self.db.clone();
-                    let pending_prepares = self.pending_prepares.clone();
+                if let Some(mut local_entries) = primary_to_entries.remove(&s.my_node_id) {
+                    let db = s.db.clone();
+                    let pending_prepares = s.pending_prepares.clone();
                     let vote_tx_clone = vote_tx.clone();
                     tokio::spawn(async move {
-                        // Sort by stripe index for deadlock prevention
                         local_entries.sort_by_key(|(_, idx)| *idx);
 
                         let mut guards: HashMap<usize, OwnedMutexGuard<HashMap<K, V>>> =
@@ -400,7 +458,6 @@ where
                         }
 
                         if lock_failed {
-                            // Vote abort — drop any acquired guards
                             let _ = vote_tx_clone.send(false).await;
                         } else {
                             pending_prepares.lock().await.insert(
@@ -410,14 +467,12 @@ where
                                     guards,
                                 },
                             );
-
-                            // Local prepare succeeds
                             let _ = vote_tx_clone.send(true).await;
                         }
                     });
                 }
 
-                // Send Prepare to remote primaries
+                // Send Prepare to remote primaries — safe to block here
                 let remote_primaries: Vec<NodeId> = primary_to_entries.keys().cloned().collect();
                 for (primary, entries) in &primary_to_entries {
                     let pairs_only: Vec<KVPair<K, V>> =
@@ -426,25 +481,23 @@ where
                         pairs: pairs_only,
                         tx_id,
                     };
-                    self.peers.send(primary, msg).await?;
+                    s.send_to_peer(primary, msg).await?;
                 }
 
                 // Register vote channel for remote votes
                 if !remote_primaries.is_empty() {
-                    self.awaiting_votes.lock().await.insert(tx_id, vote_tx);
+                    s.awaiting_votes.lock().await.insert(tx_id, vote_tx);
                 }
 
-                // Clone everything the spawned task needs
-                let pending_prepares = self.pending_prepares.clone();
-                let awaiting_votes = self.awaiting_votes.clone();
-                let my_node_id = self.my_node_id.clone();
-                let cluster = self.cluster.clone();
-                let replication_degree = self.replication_degree;
-                let all_senders = self.peers.senders.clone();
+                // Clone everything the spawned coordinator task needs
+                let pending_prepares = s.pending_prepares.clone();
+                let awaiting_votes = s.awaiting_votes.clone();
+                let my_node_id = s.my_node_id.clone();
+                let cluster = s.cluster.clone();
+                let replication_degree = s.replication_degree;
+                let all_senders = s.senders.clone();
 
-                // Spawn coordinator task to collect votes and commit/abort
                 tokio::spawn(async move {
-                    // Collect votes with a timeout to prevent distributed deadlock
                     let collect_result = tokio::time::timeout(COORDINATOR_VOTE_TIMEOUT, async {
                         for _ in 0..total_primaries {
                             match vote_rx.recv().await {
@@ -461,26 +514,21 @@ where
                     awaiting_votes.lock().await.remove(&tx_id);
 
                     if all_prepared {
-                        // Commit locally: write values and replicate
                         {
                             let mut pending = pending_prepares.lock().await;
                             if let Some(mut tx) = pending.remove(&tx_id) {
-                                // Write into held guards
                                 for (pair, stripe_idx) in &tx.pairs {
                                     if let Some(guard) = tx.guards.get_mut(stripe_idx) {
                                         guard.insert(pair.key, pair.val.clone());
                                     }
                                 }
 
-                                // Collect replication info before dropping guards
                                 let to_replicate: Vec<KVPair<K, V>> =
                                     tx.pairs.iter().map(|(p, _)| p.clone()).collect();
 
-                                // Drop guards to release stripe locks
                                 drop(tx);
                                 drop(pending);
 
-                                // Send ReplicaPut for locally-owned pairs
                                 for pair in to_replicate {
                                     let replicas = key_replica_indices(
                                         &pair.key,
@@ -501,7 +549,6 @@ where
                             }
                         }
 
-                        // Send Commit to remote primaries
                         for primary in &remote_primaries {
                             if let Some(sender) = all_senders.get(primary) {
                                 let msg = PeerMessage::Commit { tx_id };
@@ -511,10 +558,8 @@ where
 
                         let _ = response_sender.send(true);
                     } else {
-                        // Abort locally: just drop guards
                         pending_prepares.lock().await.remove(&tx_id);
 
-                        // Send Abort to remote primaries
                         for primary in &remote_primaries {
                             if let Some(sender) = all_senders.get(primary) {
                                 let msg = PeerMessage::Abort { tx_id };
@@ -526,36 +571,47 @@ where
                     }
                 });
             }
-            // tell other peers that I'm done with my tests
             LocalMessage::Done => {
                 info!("I am done with my tests, notifying peers");
-                let my_node_id = self.my_node_id.clone();
-                for (node_id, sender) in self.peers.senders.iter() {
+                let my_node_id = s.my_node_id.clone();
+                for (node_id, sender) in s.senders.iter() {
                     if *node_id != my_node_id {
                         let _ = sender.send(PeerMessage::Done).await;
                     }
                 }
-
-                let count = self.done_count.fetch_add(1, Ordering::SeqCst) + 1;
-                if count >= self.cluster.len() {
-                    // All peers done (including myself), I can exit
-                    return Ok(true);
-                }
+                s.mark_done();
             }
         }
-
-        // return false to keep running, true to shutdown
-        Ok(false)
     }
 
-    // handles messages from the network
-    async fn handle_peer_message(&self, from: NodeId, msg: PeerMessage<K, V>) -> Result<bool> {
+    Ok(())
+}
+
+async fn run_peer_loop<K, V>(
+    s: Arc<Shared<K, V>>,
+    mut inbox: mpsc::Receiver<(NodeId, PeerMessage<K, V>)>,
+) -> Result<()>
+where
+    K: Send
+        + Sync
+        + 'static
+        + Debug
+        + Serialize
+        + for<'de> Deserialize<'de>
+        + Hash
+        + Eq
+        + PartialEq
+        + Clone
+        + Copy,
+    V: Send + Sync + 'static + Debug + Serialize + for<'de> Deserialize<'de> + Clone,
+{
+    while let Some((from, msg)) = inbox.recv().await {
         debug!("Got {:?} from {}", msg, from);
         match msg {
-            // peer is asking us for a get request because we are the primary replica
+            // ── peer asks us for a GET (we're primary) ───────────────
             PeerMessage::Get { key, req_id } => {
-                let db = self.db.clone();
-                let senders = self.peers.senders.clone();
+                let db = s.db.clone();
+                let senders = s.senders.clone();
                 tokio::spawn(async move {
                     let result = db.get(&key).await;
                     let resp: PeerMessage<K, V> = PeerMessage::GetResponse {
@@ -567,13 +623,14 @@ where
                     }
                 });
             }
-            // peer is asking us for a put request because we are the primary replica
+
+            // ── peer asks us for a PUT (we're primary) ───────────────
             PeerMessage::Put { pair, req_id } => {
-                let db = self.db.clone();
-                let my_node_id = self.my_node_id.clone();
-                let cluster = self.cluster.clone();
-                let replication_degree = self.replication_degree;
-                let senders = self.peers.senders.clone();
+                let db = s.db.clone();
+                let my_node_id = s.my_node_id.clone();
+                let cluster = s.cluster.clone();
+                let replication_degree = s.replication_degree;
+                let senders = s.senders.clone();
                 tokio::spawn(async move {
                     let key = pair.key;
                     let val = pair.val.clone();
@@ -583,7 +640,6 @@ where
                         req_id,
                     };
 
-                    // broadcast this put to other replicas
                     let replicas = key_replica_indices(&key, cluster.len(), replication_degree);
                     let req = PeerMessage::ReplicaPut { pair };
                     for r_idx in &replicas {
@@ -595,26 +651,25 @@ where
                         }
                     }
 
-                    // respond to original peer that the put was successful
                     if let Some(sender) = senders.get(&from) {
                         let _ = sender.send(resp).await;
                     }
                 });
             }
-            // the primary replica is telling us to execute this put
+
+            // ── replica put from primary ─────────────────────────────
             PeerMessage::ReplicaPut { pair } => {
-                let db = self.db.clone();
+                let db = s.db.clone();
                 tokio::spawn(async move {
                     db.put(pair.key, pair.val).await;
                 });
             }
-            // received a response from a peer about a previous get request
+
+            // ── response to our earlier GET request ──────────────────
             PeerMessage::GetResponse { val, req_id } => {
-                // look up the channel for sending the response
-                let mut awaiting_get_response = self.awaiting_get_response.lock().await;
-                match awaiting_get_response.remove(&req_id) {
+                let mut awaiting = s.awaiting_get_response.lock().await;
+                match awaiting.remove(&req_id) {
                     Some(sender) => {
-                        // send the response to the local task awaiting it
                         sender.send(val).map_err(|_| {
                             anyhow!("Error sending local GetResponse for request {}", req_id)
                         })?;
@@ -624,13 +679,12 @@ where
                     }
                 };
             }
-            // received a response from a peer about a previous put request
+
+            // ── response to our earlier PUT request ──────────────────
             PeerMessage::PutResponse { success, req_id } => {
-                // look up the channel for sending the response
-                let mut awaiting_put_response = self.awaiting_put_response.lock().await;
-                match awaiting_put_response.remove(&req_id) {
+                let mut awaiting = s.awaiting_put_response.lock().await;
+                match awaiting.remove(&req_id) {
                     Some(sender) => {
-                        // send the response for the local task awaiting it
                         sender.send(success).map_err(|_| {
                             anyhow!("Error sending local PutResponse for request {}", req_id)
                         })?;
@@ -640,24 +694,24 @@ where
                     }
                 };
             }
+
+            // ── 2PC: abort from coordinator ──────────────────────────
             PeerMessage::Abort { tx_id } => {
-                // Just drop the guards, releasing locks
-                self.pending_prepares.lock().await.remove(&tx_id);
+                s.pending_prepares.lock().await.remove(&tx_id);
             }
-            // primary replica receives a prepare message from coordinator
+
+            // ── 2PC: prepare from coordinator (we're a participant) ──
             PeerMessage::Prepare { pairs, tx_id } => {
-                let db = self.db.clone();
-                let pending_prepares = self.pending_prepares.clone();
-                let senders = self.peers.senders.clone();
+                let db = s.db.clone();
+                let pending_prepares = s.pending_prepares.clone();
+                let senders = s.senders.clone();
                 tokio::spawn(async move {
-                    // Compute stripe indices and sort for deadlock prevention
                     let mut entries: Vec<(KVPair<K, V>, usize)> = pairs
                         .iter()
                         .map(|p| (p.clone(), db.stripe_index(&p.key)))
                         .collect();
                     entries.sort_by_key(|(_, idx)| *idx);
 
-                    // Try to acquire stripe locks in sorted order
                     let mut guards: HashMap<usize, OwnedMutexGuard<HashMap<K, V>>> = HashMap::new();
                     let mut lock_failed = false;
                     for (_, idx) in &entries {
@@ -680,13 +734,11 @@ where
                     }
 
                     if lock_failed {
-                        // Vote abort — drop any acquired guards
                         if let Some(sender) = senders.get(&from) {
                             let resp = PeerMessage::VoteAbort { tx_id };
                             let _ = sender.send(resp).await;
                         }
                     } else {
-                        // Store pending transaction
                         pending_prepares.lock().await.insert(
                             tx_id,
                             PendingTx {
@@ -695,7 +747,6 @@ where
                             },
                         );
 
-                        // Vote prepared
                         if let Some(sender) = senders.get(&from) {
                             let resp = PeerMessage::VotePrepared { tx_id };
                             let _ = sender.send(resp).await;
@@ -703,46 +754,43 @@ where
                     }
                 });
             }
-            // Coordinator receives a prepare vote from a primary replica
+
+            // ── 2PC: vote responses (we're coordinator) ──────────────
             PeerMessage::VotePrepared { tx_id } => {
-                let awaiting = self.awaiting_votes.lock().await;
+                let awaiting = s.awaiting_votes.lock().await;
                 if let Some(tx) = awaiting.get(&tx_id) {
                     let _ = tx.send(true).await;
                 }
             }
-            // Coordinator receives an abort vote from a primary replica
             PeerMessage::VoteAbort { tx_id } => {
-                let awaiting = self.awaiting_votes.lock().await;
+                let awaiting = s.awaiting_votes.lock().await;
                 if let Some(tx) = awaiting.get(&tx_id) {
                     let _ = tx.send(false).await;
                 }
             }
-            // primary replica can commit a txn
+
+            // ── 2PC: commit from coordinator ─────────────────────────
             PeerMessage::Commit { tx_id } => {
-                let pending_prepares = self.pending_prepares.clone();
-                let my_node_id = self.my_node_id.clone();
-                let cluster = self.cluster.clone();
-                let replication_degree = self.replication_degree;
-                let senders = self.peers.senders.clone();
+                let pending_prepares = s.pending_prepares.clone();
+                let my_node_id = s.my_node_id.clone();
+                let cluster = s.cluster.clone();
+                let replication_degree = s.replication_degree;
+                let senders = s.senders.clone();
                 tokio::spawn(async move {
                     let mut pending = pending_prepares.lock().await;
                     if let Some(mut tx) = pending.remove(&tx_id) {
-                        // Write values into held guards
                         for (pair, stripe_idx) in &tx.pairs {
                             if let Some(guard) = tx.guards.get_mut(stripe_idx) {
                                 guard.insert(pair.key, pair.val.clone());
                             }
                         }
 
-                        // Collect replication info before dropping
                         let to_replicate: Vec<KVPair<K, V>> =
                             tx.pairs.iter().map(|(p, _)| p.clone()).collect();
 
-                        // Release locks
                         drop(tx);
                         drop(pending);
 
-                        // Replicate to non-primary replicas
                         for pair in to_replicate {
                             let replicas =
                                 key_replica_indices(&pair.key, cluster.len(), replication_degree);
@@ -759,33 +807,20 @@ where
                     }
                 });
             }
-            // a peer has finished their test
+
+            // ── peer finished their test ─────────────────────────────
             PeerMessage::Done => {
                 info!("{} is done with their test", from);
-                let count = self.done_count.fetch_add(1, Ordering::SeqCst) + 1;
-                if count >= self.cluster.len() {
-                    // All peers done (including myself), I can exit
-                    return Ok(true);
-                }
+                s.mark_done();
             }
         }
-
-        // keep running
-        Ok(false)
     }
 
-    // maps the key to the replica nodes
-    fn get_key_replicas(&self, key: &K) -> Vec<&NodeId> {
-        key_replica_indices(key, self.cluster.len(), self.replication_degree)
-            .into_iter()
-            .map(|i| &self.cluster[i])
-            .collect()
-    }
+    Ok(())
 }
 
 // Pure function: given a sorted cluster and replication degree, return the
 // indices of nodes that own this key.
-// Separated for testing logic
 fn key_replica_indices<K: Hash>(
     key: &K,
     cluster_len: usize,
@@ -854,7 +889,6 @@ mod tests {
         let key: u64 = 7;
         let replicas = key_replica_indices(&key, cluster.len(), 3);
 
-        // each subsequent replica should be (prev + 1) % cluster_len
         for i in 1..replicas.len() {
             assert_eq!(replicas[i], (replicas[i - 1] + 1) % cluster.len());
         }
@@ -864,7 +898,6 @@ mod tests {
     fn degree_capped_at_cluster_size() {
         let cluster = make_cluster(3);
         let key: u64 = 55;
-        // request degree 10 but only 3 nodes exist
         let replicas = key_replica_indices(&key, cluster.len(), 10);
         assert_eq!(replicas.len(), 3);
     }
@@ -883,13 +916,11 @@ mod tests {
         let cluster = make_cluster(5);
         let mut primary_counts = vec![0usize; cluster.len()];
 
-        // hash a bunch of keys and count which node is primary
         for key in 0u64..1000 {
             let replicas = key_replica_indices(&key, cluster.len(), 1);
             primary_counts[replicas[0]] += 1;
         }
 
-        // every node should get at least some keys (sanity check distribution)
         for (i, count) in primary_counts.iter().enumerate() {
             assert!(
                 *count > 50,
@@ -903,7 +934,6 @@ mod tests {
     #[test]
     fn wraps_around_ring() {
         let cluster = make_cluster(5);
-        // find a key whose primary is the last node
         let key = (0u64..10000)
             .find(|k| {
                 let replicas = key_replica_indices(k, cluster.len(), 1);
@@ -913,7 +943,7 @@ mod tests {
 
         let replicas = key_replica_indices(&key, cluster.len(), 3);
         assert_eq!(replicas[0], cluster.len() - 1);
-        assert_eq!(replicas[1], 0); // wraps to first node
+        assert_eq!(replicas[1], 0);
         assert_eq!(replicas[2], 1);
     }
 }

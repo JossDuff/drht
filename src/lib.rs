@@ -235,6 +235,7 @@ where
 
     // handles messages from the test harness and from the network loop when peers respond
     async fn handle_local_message(&self, msg: LocalMessage<K, V>) -> Result<bool> {
+        debug!("Got {:?}", msg);
         match msg {
             // sends GET request to the primary replica
             LocalMessage::Get {
@@ -527,6 +528,7 @@ where
             }
             // tell other peers that I'm done with my tests
             LocalMessage::Done => {
+                info!("I am done with my tests, notifying peers");
                 let my_node_id = self.my_node_id.clone();
                 for (node_id, sender) in self.peers.senders.iter() {
                     if *node_id != my_node_id {
@@ -759,6 +761,7 @@ where
             }
             // a peer has finished their test
             PeerMessage::Done => {
+                info!("{} is done with their test", from);
                 let count = self.done_count.fetch_add(1, Ordering::SeqCst) + 1;
                 if count >= self.cluster.len() {
                     // All peers done (including myself), I can exit

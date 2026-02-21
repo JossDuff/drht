@@ -7,6 +7,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use tracing::{error, info};
 
+// set the percentage of PUT and TRI_PUT operations.  Everything else is GET
+const PUT_FREQUENCY: usize = 20;
+const TRI_PUT_FREQUENCY: usize = 20;
+
 #[tokio::main(worker_threads = 4)]
 async fn main() -> Result<()> {
     // init logger
@@ -139,38 +143,40 @@ async fn main() -> Result<()> {
 
 fn generate_test_operations(num_operations: usize, key_range: u64) -> Vec<Operation> {
     let mut rng = rand::rng();
+    let total = PUT_FREQUENCY + TRI_PUT_FREQUENCY; // everything else is get
 
     (0..num_operations)
-        // generates rand number in 0..9
-        .map(|_| match rng.random_range(0..10) {
-            // range 0 or 1 (20%)
-            0..=1 => Operation::Put {
-                pair: KVPair {
+        .map(|_| {
+            let roll = rng.random_range(0..100);
+            if roll < PUT_FREQUENCY {
+                Operation::Put {
+                    pair: KVPair {
+                        key: rng.random_range(0..key_range),
+                        val: rng.random(),
+                    },
+                }
+            } else if roll < total {
+                Operation::TriPut {
+                    pairs: [
+                        KVPair {
+                            key: rng.random_range(0..key_range),
+                            val: rng.random(),
+                        },
+                        KVPair {
+                            key: rng.random_range(0..key_range),
+                            val: rng.random(),
+                        },
+                        KVPair {
+                            key: rng.random_range(0..key_range),
+                            val: rng.random(),
+                        },
+                    ],
+                }
+            } else {
+                Operation::Get {
                     key: rng.random_range(0..key_range),
-                    val: rng.random(),
-                },
-            },
-            // range 2 or 3 (20%)
-            2..=3 => Operation::TriPut {
-                pairs: [
-                    KVPair {
-                        key: rng.random_range(0..key_range),
-                        val: rng.random(),
-                    },
-                    KVPair {
-                        key: rng.random_range(0..key_range),
-                        val: rng.random(),
-                    },
-                    KVPair {
-                        key: rng.random_range(0..key_range),
-                        val: rng.random(),
-                    },
-                ],
-            },
-            // range 4..9 (60%)
-            _ => Operation::Get {
-                key: rng.random_range(0..key_range),
-            },
+                }
+            }
         })
         .collect()
 }

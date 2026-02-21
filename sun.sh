@@ -31,36 +31,38 @@ NC='\033[0m'
 
 usage() {
     cat <<'EOF'
-Usage: sun <command> [options]
+    Usage: sun.sh <command> [options]
 
-Commands:
-  list                              List all nodes with their current CPU load
-  run -n <num> [-- args...]         Run 'target/release/dht' on N least-loaded nodes
-  exec -n <num> -- <command>        Run arbitrary command on N least-loaded nodes
-  kill [name]                       Kill processes on all nodes (default: 'dht')
+    Commands:
+    list                              List all nodes with their current CPU load
+    run -n <num> [-- args...]         Run 'target/release/dht' on N least-loaded nodes
+    exec -n <num> -- <command>        Run arbitrary command on N least-loaded nodes
+    kill [name]                       Kill processes on all nodes (default: 'dht')
 
-Options:
-  -n <num>      Number of nodes to use (required for 'run' and 'exec')
-  -k <num>      Number of keys for benchmark (passed to dht)
-  -r <num>      Key range for benchmark (passed to dht)
-  -d <dir>      Project directory (default: current directory)
-  -h, --help    Show this help
+    Options:
+    -n <num>      Number of nodes to use (required for 'run' and 'exec')
+    -k <num>      Number of keys for benchmark (passed to dht)
+    -r <num>      Key range for benchmark (passed to dht)
+    -d <dir>      Project directory (default: current directory)
+    -v            Enable debug logging (RUST_LOG=debug instead of info)
+    -h, --help    Show this help
 
-Examples:
-  sun list
-  sun run -n 3
-  sun run -n 3 -k 100000
-  sun run -n 3 -k 100000 -r 1000
-  sun run -n 3 -- --keys 1000 --ops 50000
-  sun run -n 5 -d ~/dev/cse476/project -- --config config.toml
-  sun exec -n 3 -- hostname
-  sun exec -n 5 -- "cd ~/dev/project && ./my_script.sh"
-  sun kill                          Kill 'dht' on all nodes
-  sun kill myapp                    Kill 'myapp' on all nodes
+    Examples:
+    sun.sh list
+    sun.sh run -n 3
+    sun.sh run -n 3 -v                   Run with debug logging
+    sun.sh run -n 3 -k 100000
+    sun.sh run -n 3 -k 100000 -r 1000
+    sun.sh run -n 3 -- --keys 1000 --ops 50000
+    sun.sh run -n 5 -d ~/dev/cse476/project -- --config config.toml
+    sun.sh exec -n 3 -- hostname
+    sun.sh exec -n 5 -- "cd ~/dev/project && ./my_script.sh"
+    sun.sh kill                          Kill 'dht' on all nodes
+    sun.sh kill myapp                    Kill 'myapp' on all nodes
 
-Logs are saved to: logs/<node>.log
+    Logs are saved to: logs/<node>.log
 
-Ctrl+C stops all nodes and cleans up.
+    Ctrl+C stops all nodes and cleans up.
 EOF
     exit 0
 }
@@ -449,6 +451,10 @@ while [[ $# -gt 0 ]]; do
     -d)
         PROJECT_DIR="$2"
         shift 2
+        ;;
+    -v)
+        RUST_LOG="debug"
+        shift
         ;;
     -h | --help)
         usage

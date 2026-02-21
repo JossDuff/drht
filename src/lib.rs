@@ -212,7 +212,10 @@ where
             // TODO: make these two separate tasks
             tokio::select! {
                 Some(local_msg) = self.local_inbox.recv() => {
-                    self.handle_local_message(local_msg).await?;
+                    if self.handle_local_message(local_msg).await? {
+                        info!("All peers done, shutting down");
+                        break;
+                    }
                 }
                 Some((from, peer_msg)) = self.peers.inbox.recv() => {
                     // returns true when all peers are done
@@ -231,7 +234,7 @@ where
     }
 
     // handles messages from the test harness and from the network loop when peers respond
-    async fn handle_local_message(&self, msg: LocalMessage<K, V>) -> Result<()> {
+    async fn handle_local_message(&self, msg: LocalMessage<K, V>) -> Result<bool> {
         match msg {
             // sends GET request to the primary replica
             LocalMessage::Get {
@@ -530,10 +533,17 @@ where
                         let _ = sender.send(PeerMessage::Done).await;
                     }
                 }
+
+                let count = self.done_count.fetch_add(1, Ordering::SeqCst) + 1;
+                if count >= self.cluster.len() {
+                    // All peers done (including myself), I can exit
+                    return Ok(true);
+                }
             }
         }
 
-        Ok(())
+        // return false to keep running, true to shutdown
+        Ok(false)
     }
 
     // handles messages from the network
@@ -750,8 +760,8 @@ where
             // a peer has finished their test
             PeerMessage::Done => {
                 let count = self.done_count.fetch_add(1, Ordering::SeqCst) + 1;
-                if count >= self.cluster.len() - 1 {
-                    // All peers done, we can exit
+                if count >= self.cluster.len() {
+                    // All peers done (including myself), I can exit
                     return Ok(true);
                 }
             }

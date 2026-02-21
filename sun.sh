@@ -31,38 +31,38 @@ NC='\033[0m'
 
 usage() {
     cat <<'EOF'
-    Usage: sun.sh <command> [options]
+Usage: sun.sh <command> [options]
 
-    Commands:
-    list                              List all nodes with their current CPU load
-    run -n <num> [-- args...]         Run 'target/release/dht' on N least-loaded nodes
-    exec -n <num> -- <command>        Run arbitrary command on N least-loaded nodes
-    kill [name]                       Kill processes on all nodes (default: 'dht')
+Commands:
+  list                              List all nodes with their current CPU load
+  run -n <num> [-- args...]         Run 'target/release/dht' on N least-loaded nodes
+  exec -n <num> -- <command>        Run arbitrary command on N least-loaded nodes
+  kill [name]                       Kill processes on all nodes (default: 'dht')
 
-    Options:
-    -n <num>      Number of nodes to use (required for 'run' and 'exec')
-    -k <num>      Number of keys for benchmark (passed to dht)
-    -r <num>      Key range for benchmark (passed to dht)
-    -d <dir>      Project directory (default: current directory)
-    -v            Enable debug logging (RUST_LOG=debug instead of info)
-    -h, --help    Show this help
+Options:
+  -n <num>      Number of nodes to use (required for 'run' and 'exec')
+  -k <num>      Number of keys for benchmark (passed to dht)
+  -r <num>      Key range for benchmark (passed to dht)
+  -d <dir>      Project directory (default: current directory)
+  -v            Enable debug logging (RUST_LOG=debug instead of info)
+  -h, --help    Show this help
 
-    Examples:
-    sun.sh list
-    sun.sh run -n 3
-    sun.sh run -n 3 -v                   Run with debug logging
-    sun.sh run -n 3 -k 100000
-    sun.sh run -n 3 -k 100000 -r 1000
-    sun.sh run -n 3 -- --keys 1000 --ops 50000
-    sun.sh run -n 5 -d ~/dev/cse476/project -- --config config.toml
-    sun.sh exec -n 3 -- hostname
-    sun.sh exec -n 5 -- "cd ~/dev/project && ./my_script.sh"
-    sun.sh kill                          Kill 'dht' on all nodes
-    sun.sh kill myapp                    Kill 'myapp' on all nodes
+Examples:
+  sun.sh list
+  sun.sh run -n 3
+  sun.sh run -n 3 -v                   Run with debug logging
+  sun.sh run -n 3 -k 100000
+  sun.sh run -n 3 -k 100000 -r 1000
+  sun.sh run -n 3 -- --keys 1000 --ops 50000
+  sun.sh run -n 5 -d ~/dev/cse476/project -- --config config.toml
+  sun.sh exec -n 3 -- hostname
+  sun.sh exec -n 5 -- "cd ~/dev/project && ./my_script.sh"
+  sun.sh kill                          Kill 'dht' on all nodes
+  sun.sh kill myapp                    Kill 'myapp' on all nodes
 
-    Logs are saved to: logs/<node>.log
+Logs are saved to: logs/<node>.log
 
-    Ctrl+C stops all nodes and cleans up.
+Ctrl+C stops all nodes and cleans up.
 EOF
     exit 0
 }
@@ -289,7 +289,8 @@ cmd_run() {
     local project_dir="$2"
     local num_keys="$3"
     local key_range="$4"
-    shift 4
+    local rust_log="$5"
+    shift 5
     local program_args="$*"
 
     echo -e "${GREEN}=== Running on Cluster ===${NC}"
@@ -304,6 +305,7 @@ cmd_run() {
 
     echo ""
     echo -e "Directory: ${BLUE}$project_dir${NC}"
+    echo -e "Log level: ${BLUE}$rust_log${NC}"
     if [[ -n "$num_keys" ]]; then
         echo -e "Num keys: ${BLUE}$num_keys${NC}"
     fi
@@ -351,7 +353,7 @@ cmd_run() {
         local connections
         connections=$(get_connections "$node" "${nodes[@]}")
 
-        local cmd="cd $project_dir && cargo build --release --quiet --target-dir $TARGET_DIR && RUST_LOG=info $TARGET_DIR/release/dht --name $node --connections $connections"
+        local cmd="cd $project_dir && cargo build --release --quiet --target-dir $TARGET_DIR && export RUST_LOG=$rust_log && $TARGET_DIR/release/dht --name $node --connections $connections"
         if [[ -n "$num_keys" ]]; then
             cmd="$cmd --num-keys $num_keys"
         fi
@@ -432,6 +434,7 @@ NUM_NODES=""
 PROJECT_DIR="$(pwd)"
 NUM_KEYS=""
 KEY_RANGE=""
+RUST_LOG="info"
 EXTRA_ARGS=""
 
 while [[ $# -gt 0 ]]; do
@@ -485,7 +488,7 @@ run)
         echo -e "${RED}Error: Number of nodes must be a positive integer${NC}"
         exit 1
     fi
-    cmd_run "$NUM_NODES" "$PROJECT_DIR" "$NUM_KEYS" "$KEY_RANGE" $EXTRA_ARGS
+    cmd_run "$NUM_NODES" "$PROJECT_DIR" "$NUM_KEYS" "$KEY_RANGE" "$RUST_LOG" $EXTRA_ARGS
     ;;
 exec)
     if [[ -z "$NUM_NODES" ]]; then

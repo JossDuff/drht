@@ -649,6 +649,12 @@ where
                         req_id,
                     };
 
+                    // Send PutResponse BEFORE ReplicaPut so the requester
+                    // isn't blocked waiting behind replica writes
+                    if let Some(sender) = senders.get(&from) {
+                        let _ = sender.send(resp).await;
+                    }
+
                     let replicas = key_replica_indices(&key, cluster.len(), replication_degree);
                     let req = PeerMessage::ReplicaPut { pair };
                     for r_idx in &replicas {
@@ -658,10 +664,6 @@ where
                                 let _ = sender.send(req.clone()).await;
                             }
                         }
-                    }
-
-                    if let Some(sender) = senders.get(&from) {
-                        let _ = sender.send(resp).await;
                     }
                 });
             }
@@ -679,12 +681,12 @@ where
                 let mut awaiting = s.awaiting_get_response.lock().await;
                 match awaiting.remove(&req_id) {
                     Some(sender) => {
-                        sender.send(val).map_err(|_| {
-                            anyhow!("Error sending local GetResponse for request {}", req_id)
-                        })?;
+                        if sender.send(val).is_err() {
+                            error!("Failed to deliver GetResponse for req {}", req_id);
+                        }
                     }
                     None => {
-                        return Err(anyhow!("Receiver for req_id {} dropped", req_id));
+                        error!("GetResponse for unknown req_id {}", req_id);
                     }
                 };
             }
@@ -694,12 +696,12 @@ where
                 let mut awaiting = s.awaiting_put_response.lock().await;
                 match awaiting.remove(&req_id) {
                     Some(sender) => {
-                        sender.send(success).map_err(|_| {
-                            anyhow!("Error sending local PutResponse for request {}", req_id)
-                        })?;
+                        if sender.send(success).is_err() {
+                            error!("Failed to deliver PutResponse for req {}", req_id);
+                        }
                     }
                     None => {
-                        return Err(anyhow!("Receiver for req_id {} dropped", req_id));
+                        error!("PutResponse for unknown req_id {}", req_id);
                     }
                 };
             }

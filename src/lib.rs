@@ -20,7 +20,7 @@ use std::{
 };
 use tokio::sync::OwnedMutexGuard;
 use tokio::sync::{mpsc, oneshot, Mutex, Notify};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 const CHANNEL_BUFFER_SIZE: usize = 4;
 const COORDINATOR_VOTE_TIMEOUT: Duration = Duration::from_millis(200);
@@ -440,7 +440,13 @@ where
                     .map(|(primary, entries)| {
                         let pairs_only: Vec<KVPair<K, V>> =
                             entries.iter().map(|(p, _)| p.clone()).collect();
-                        (primary.clone(), PeerMessage::Prepare { pairs: pairs_only, tx_id })
+                        (
+                            primary.clone(),
+                            PeerMessage::Prepare {
+                                pairs: pairs_only,
+                                tx_id,
+                            },
+                        )
                     })
                     .collect();
 
@@ -452,7 +458,9 @@ where
                 // Register vote channel BEFORE sending Prepare to avoid
                 // race where VotePrepared arrives before registration
                 if !remote_primaries.is_empty() {
+                    debug!("Getting lock on awaiting_votes for {tx_id}");
                     s.awaiting_votes.lock().await.insert(tx_id, vote_tx);
+                    debug!("Added {} to awaiting_votes", tx_id);
                 }
 
                 // Clone everything the spawned coordinator task needs
@@ -475,15 +483,19 @@ where
                         let mut guards: HashMap<usize, OwnedMutexGuard<HashMap<K, V>>> =
                             HashMap::new();
                         let mut lock_failed = false;
-                        for (_, idx) in &entries {
+                        for (pair, idx) in &entries {
                             if !guards.contains_key(idx) {
                                 let stripe = db.get_stripe_by_index(*idx);
                                 match stripe.try_lock_owned() {
                                     Ok(guard) => {
+                                        debug!(
+                                            "Local prepare try_lock successful for stripe index {}, key {:?}, tx {}",
+                                            idx, pair.key, tx_id
+                                        );
                                         guards.insert(*idx, guard);
                                     }
                                     Err(_) => {
-                                        debug!("Local prepare try_lock failed for tx {}", tx_id);
+                                        debug!("Local prepare try_lock failed for stripe index {}, key {:?}, tx {}", idx, pair.key,tx_id);
                                         lock_failed = true;
                                         break;
                                     }
@@ -494,6 +506,7 @@ where
                         if lock_failed {
                             false
                         } else {
+                            debug!("Getting lock on pending_prepares for {tx_id}");
                             pending_prepares.lock().await.insert(
                                 tx_id,
                                 PendingTx {
@@ -501,6 +514,7 @@ where
                                     guards,
                                 },
                             );
+                            debug!("Added {tx_id} to pending_prepares");
                             true
                         }
                     } else {
@@ -515,9 +529,11 @@ where
                     }
 
                     // ── Collect remote votes (with timeout) ──────────
+                    // true if we receive enough votes, false otherwise
                     let remote_ok = if num_remote == 0 {
                         true
                     } else {
+                        // true if we receive enough votes, false otherwise
                         let collect_result =
                             tokio::time::timeout(COORDINATOR_VOTE_TIMEOUT, async {
                                 for _ in 0..num_remote {
@@ -529,10 +545,18 @@ where
                                 true
                             })
                             .await;
-                        matches!(collect_result, Ok(true))
+                        if let Ok(true) = collect_result {
+                            debug!("Got enough remote votes for tri_put tx {}", tx_id);
+                            true
+                        } else {
+                            debug!("Did not get enough remote votes for tri_put tx {}", tx_id);
+                            false
+                        }
                     };
 
+                    debug!("Getting lock on awaiting_votes for {tx_id}");
                     awaiting_votes.lock().await.remove(&tx_id);
+                    debug!("Removed {} from awaiting_votes", tx_id);
 
                     let all_prepared = local_voted && remote_ok;
 
@@ -540,9 +564,21 @@ where
                         {
                             let mut pending = pending_prepares.lock().await;
                             if let Some(mut tx) = pending.remove(&tx_id) {
+                                debug!("removed {} from pending_prepares", tx_id);
                                 for (pair, stripe_idx) in &tx.pairs {
                                     if let Some(guard) = tx.guards.get_mut(stripe_idx) {
+                                        debug!(
+                                            "Inserting key {:?}, val {:?} for tx {} into guard",
+                                            pair.key,
+                                            pair.val.clone(),
+                                            tx_id
+                                        );
                                         guard.insert(pair.key, pair.val.clone());
+                                    } else {
+                                        warn!(
+                                            "stripe {} not found in guards for tx {}",
+                                            stripe_idx, tx_id
+                                        );
                                     }
                                 }
 
@@ -558,6 +594,7 @@ where
                                     if let Some(sender) = all_senders.get(primary) {
                                         let msg = PeerMessage::Commit { tx_id };
                                         let _ = sender.send(msg).await;
+                                        //debug!("Sent commit message for tx {tx_id} to {primary}");
                                     }
                                 }
 
@@ -574,10 +611,13 @@ where
                                                 let msg =
                                                     PeerMessage::ReplicaPut { pair: pair.clone() };
                                                 let _ = sender.send(msg).await;
+                                                // debug!("Sent replica put message for tx {tx_id} to {replica}");
                                             }
                                         }
                                     }
                                 }
+                            } else {
+                                warn!("tx {} not found in pending_prepares", tx_id);
                             }
                         }
 
@@ -724,7 +764,9 @@ where
 
             // ── 2PC: abort from coordinator ──────────────────────────
             PeerMessage::Abort { tx_id } => {
+                debug!("2pc abort: Received Abort from coordinator for tx_id {tx_id}, removing from pending_prepares...");
                 s.pending_prepares.lock().await.remove(&tx_id);
+                debug!("2pc abort: Successfully removed {tx_id} from pending_prepares");
             }
 
             // ── 2PC: prepare from coordinator (we're a participant) ──
@@ -746,11 +788,12 @@ where
                             let stripe = db.get_stripe_by_index(*idx);
                             match stripe.try_lock_owned() {
                                 Ok(guard) => {
+                                    debug!("Inserting stripe index {idx} to guard for tx {tx_id}");
                                     guards.insert(*idx, guard);
                                 }
                                 Err(_) => {
                                     debug!(
-                                        "Prepare try_lock failed for tx {} on stripe {}",
+                                        "2PC prepare: Prepare try_lock failed for tx {} on stripe {}",
                                         tx_id, idx
                                     );
                                     lock_failed = true;
@@ -766,6 +809,7 @@ where
                             let _ = sender.send(resp).await;
                         }
                     } else {
+                        debug!("2pc prepare: getting lock on pending_prepares for {tx_id}");
                         pending_prepares.lock().await.insert(
                             tx_id,
                             PendingTx {
@@ -773,6 +817,7 @@ where
                                 guards,
                             },
                         );
+                        debug!("2PC prepare: Adding tx {tx_id} to pending_prepares");
 
                         if let Some(sender) = senders.get(&from) {
                             let resp = PeerMessage::VotePrepared { tx_id };
@@ -785,32 +830,43 @@ where
             // ── 2PC: vote responses (we're coordinator) ──────────────
             PeerMessage::VotePrepared { tx_id } => {
                 let tx = {
+                    debug!("2pc voteprepated: getting lock on awaiting_votes for {tx_id}...");
                     let awaiting = s.awaiting_votes.lock().await;
+                    debug!("2pc voteprepated: got lock on awaiting_votes for {tx_id}");
                     awaiting.get(&tx_id).cloned()
                 };
                 if let Some(tx) = tx {
                     let _ = tx.send(true).await;
+                } else {
+                    warn!("2pc voteprepared: No sender for {tx_id}");
                 }
             }
             PeerMessage::VoteAbort { tx_id } => {
                 let tx = {
+                    debug!("2pc voteabort: getting lock on awaiting_votes for {tx_id}...");
                     let awaiting = s.awaiting_votes.lock().await;
+                    debug!("2pc voteabort: got lock on awaiting_votes for {tx_id}");
                     awaiting.get(&tx_id).cloned()
                 };
                 if let Some(tx) = tx {
                     let _ = tx.send(false).await;
+                } else {
+                    warn!("2pc voteabort: No sender for {tx_id}");
                 }
             }
 
             // ── 2PC: commit from coordinator ─────────────────────────
             PeerMessage::Commit { tx_id } => {
+                debug!("Attempting to commit {tx_id}");
                 let pending_prepares = s.pending_prepares.clone();
                 let my_node_id = s.my_node_id.clone();
                 let cluster = s.cluster.clone();
                 let replication_degree = s.replication_degree;
                 let senders = s.senders.clone();
                 tokio::spawn(async move {
+                    debug!("2pc commit: getting lock on pending_prepares for {tx_id}...");
                     let mut pending = pending_prepares.lock().await;
+                    debug!("2pc commit: got lock on pending_prepares for {tx_id}");
                     if let Some(mut tx) = pending.remove(&tx_id) {
                         for (pair, stripe_idx) in &tx.pairs {
                             if let Some(guard) = tx.guards.get_mut(stripe_idx) {

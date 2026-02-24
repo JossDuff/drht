@@ -561,7 +561,8 @@ where
                     let all_prepared = local_voted && remote_ok;
 
                     if all_prepared {
-                        {
+                        // Apply local changes (if any) and collect pairs to replicate
+                        let local_to_replicate = {
                             let mut pending = pending_prepares.lock().await;
                             if let Some(mut tx) = pending.remove(&tx_id) {
                                 debug!("removed {} from pending_prepares", tx_id);
@@ -581,43 +582,41 @@ where
                                         );
                                     }
                                 }
-
                                 let to_replicate: Vec<KVPair<K, V>> =
                                     tx.pairs.iter().map(|(p, _)| p.clone()).collect();
+                                Some(to_replicate)
+                            } else {
+                                None
+                            }
+                        };
 
-                                drop(tx);
-                                drop(pending);
+                        // Send Commit BEFORE ReplicaPut so remote
+                        // participants release their locks promptly
+                        for primary in &remote_primaries {
+                            if let Some(sender) = all_senders.get(primary) {
+                                let msg = PeerMessage::Commit { tx_id };
+                                let _ = sender.send(msg).await;
+                            }
+                        }
 
-                                // Send Commit BEFORE ReplicaPut so remote
-                                // participants release their locks promptly
-                                for primary in &remote_primaries {
-                                    if let Some(sender) = all_senders.get(primary) {
-                                        let msg = PeerMessage::Commit { tx_id };
-                                        let _ = sender.send(msg).await;
-                                        //debug!("Sent commit message for tx {tx_id} to {primary}");
-                                    }
-                                }
-
-                                for pair in to_replicate {
-                                    let replicas = key_replica_indices(
-                                        &pair.key,
-                                        cluster.len(),
-                                        replication_degree,
-                                    );
-                                    for r_idx in replicas {
-                                        let replica = &cluster[r_idx];
-                                        if *replica != my_node_id {
-                                            if let Some(sender) = all_senders.get(replica) {
-                                                let msg =
-                                                    PeerMessage::ReplicaPut { pair: pair.clone() };
-                                                let _ = sender.send(msg).await;
-                                                // debug!("Sent replica put message for tx {tx_id} to {replica}");
-                                            }
+                        // Replicate local entries to non-primary replicas
+                        if let Some(to_replicate) = local_to_replicate {
+                            for pair in to_replicate {
+                                let replicas = key_replica_indices(
+                                    &pair.key,
+                                    cluster.len(),
+                                    replication_degree,
+                                );
+                                for r_idx in replicas {
+                                    let replica = &cluster[r_idx];
+                                    if *replica != my_node_id {
+                                        if let Some(sender) = all_senders.get(replica) {
+                                            let msg =
+                                                PeerMessage::ReplicaPut { pair: pair.clone() };
+                                            let _ = sender.send(msg).await;
                                         }
                                     }
                                 }
-                            } else {
-                                warn!("tx {} not found in pending_prepares", tx_id);
                             }
                         }
 

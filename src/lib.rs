@@ -427,21 +427,55 @@ where
                         .push((pair, stripe_idx));
                 }
 
-                let total_primaries = primary_to_entries.len();
-                let (vote_tx, mut vote_rx) = mpsc::channel(total_primaries);
+                // Extract local entries (if any) — handled inline in
+                // the coordinator task to avoid a race where the
+                // coordinator aborts before a separately-spawned local
+                // prepare inserts its guards, orphaning stripe locks.
+                let local_entries = primary_to_entries.remove(&s.my_node_id);
 
-                // Prepare locally if this node is primary for any keys
-                if let Some(mut local_entries) = primary_to_entries.remove(&s.my_node_id) {
-                    let db = s.db.clone();
-                    let pending_prepares = s.pending_prepares.clone();
-                    let vote_tx_clone = vote_tx.clone();
-                    tokio::spawn(async move {
-                        local_entries.sort_by_key(|(_, idx)| *idx);
+                // Compute remote primaries and build prepare messages
+                let remote_primaries: Vec<NodeId> = primary_to_entries.keys().cloned().collect();
+                let remote_prepare_msgs: Vec<(NodeId, PeerMessage<K, V>)> = primary_to_entries
+                    .iter()
+                    .map(|(primary, entries)| {
+                        let pairs_only: Vec<KVPair<K, V>> =
+                            entries.iter().map(|(p, _)| p.clone()).collect();
+                        (primary.clone(), PeerMessage::Prepare { pairs: pairs_only, tx_id })
+                    })
+                    .collect();
+
+                // Vote channel only carries remote votes; local result
+                // is known synchronously inside the coordinator task.
+                let num_remote = remote_primaries.len();
+                let (vote_tx, mut vote_rx) = mpsc::channel(num_remote.max(1));
+
+                // Register vote channel BEFORE sending Prepare to avoid
+                // race where VotePrepared arrives before registration
+                if !remote_primaries.is_empty() {
+                    s.awaiting_votes.lock().await.insert(tx_id, vote_tx);
+                }
+
+                // Clone everything the spawned coordinator task needs
+                let db = s.db.clone();
+                let pending_prepares = s.pending_prepares.clone();
+                let awaiting_votes = s.awaiting_votes.clone();
+                let my_node_id = s.my_node_id.clone();
+                let cluster = s.cluster.clone();
+                let replication_degree = s.replication_degree;
+                let all_senders = s.senders.clone();
+
+                // Spawn coordinator task — handles local prepare, sends
+                // Prepare, and waits for votes without blocking the
+                // local loop
+                tokio::spawn(async move {
+                    // ── Local prepare (inline, no separate spawn) ─────
+                    let local_voted = if let Some(mut entries) = local_entries {
+                        entries.sort_by_key(|(_, idx)| *idx);
 
                         let mut guards: HashMap<usize, OwnedMutexGuard<HashMap<K, V>>> =
                             HashMap::new();
                         let mut lock_failed = false;
-                        for (_, idx) in &local_entries {
+                        for (_, idx) in &entries {
                             if !guards.contains_key(idx) {
                                 let stripe = db.get_stripe_by_index(*idx);
                                 match stripe.try_lock_owned() {
@@ -458,69 +492,49 @@ where
                         }
 
                         if lock_failed {
-                            let _ = vote_tx_clone.send(false).await;
+                            false
                         } else {
                             pending_prepares.lock().await.insert(
                                 tx_id,
                                 PendingTx {
-                                    pairs: local_entries,
+                                    pairs: entries,
                                     guards,
                                 },
                             );
-                            let _ = vote_tx_clone.send(true).await;
+                            true
                         }
-                    });
-                }
+                    } else {
+                        true // no local entries to prepare
+                    };
 
-                // Compute remote primaries and build prepare messages
-                let remote_primaries: Vec<NodeId> = primary_to_entries.keys().cloned().collect();
-                let remote_prepare_msgs: Vec<(NodeId, PeerMessage<K, V>)> = primary_to_entries
-                    .iter()
-                    .map(|(primary, entries)| {
-                        let pairs_only: Vec<KVPair<K, V>> =
-                            entries.iter().map(|(p, _)| p.clone()).collect();
-                        (primary.clone(), PeerMessage::Prepare { pairs: pairs_only, tx_id })
-                    })
-                    .collect();
-
-                // Register vote channel BEFORE sending Prepare to avoid
-                // race where VotePrepared arrives before registration
-                if !remote_primaries.is_empty() {
-                    s.awaiting_votes.lock().await.insert(tx_id, vote_tx);
-                }
-
-                // Clone everything the spawned coordinator task needs
-                let pending_prepares = s.pending_prepares.clone();
-                let awaiting_votes = s.awaiting_votes.clone();
-                let my_node_id = s.my_node_id.clone();
-                let cluster = s.cluster.clone();
-                let replication_degree = s.replication_degree;
-                let all_senders = s.senders.clone();
-
-                // Spawn coordinator task — sends Prepare and waits for
-                // votes without blocking the local loop
-                tokio::spawn(async move {
-                    // Send Prepare to remote primaries
+                    // ── Send Prepare to remote primaries ─────────────
                     for (primary, msg) in &remote_prepare_msgs {
                         if let Some(sender) = all_senders.get(primary) {
                             let _ = sender.send(msg.clone()).await;
                         }
                     }
 
-                    let collect_result = tokio::time::timeout(COORDINATOR_VOTE_TIMEOUT, async {
-                        for _ in 0..total_primaries {
-                            match vote_rx.recv().await {
-                                Some(true) => {}
-                                _ => return false,
-                            }
-                        }
+                    // ── Collect remote votes (with timeout) ──────────
+                    let remote_ok = if num_remote == 0 {
                         true
-                    })
-                    .await;
-
-                    let all_prepared = matches!(collect_result, Ok(true));
+                    } else {
+                        let collect_result =
+                            tokio::time::timeout(COORDINATOR_VOTE_TIMEOUT, async {
+                                for _ in 0..num_remote {
+                                    match vote_rx.recv().await {
+                                        Some(true) => {}
+                                        _ => return false,
+                                    }
+                                }
+                                true
+                            })
+                            .await;
+                        matches!(collect_result, Ok(true))
+                    };
 
                     awaiting_votes.lock().await.remove(&tx_id);
+
+                    let all_prepared = local_voted && remote_ok;
 
                     if all_prepared {
                         {
@@ -537,6 +551,15 @@ where
 
                                 drop(tx);
                                 drop(pending);
+
+                                // Send Commit BEFORE ReplicaPut so remote
+                                // participants release their locks promptly
+                                for primary in &remote_primaries {
+                                    if let Some(sender) = all_senders.get(primary) {
+                                        let msg = PeerMessage::Commit { tx_id };
+                                        let _ = sender.send(msg).await;
+                                    }
+                                }
 
                                 for pair in to_replicate {
                                     let replicas = key_replica_indices(
@@ -555,13 +578,6 @@ where
                                         }
                                     }
                                 }
-                            }
-                        }
-
-                        for primary in &remote_primaries {
-                            if let Some(sender) = all_senders.get(primary) {
-                                let msg = PeerMessage::Commit { tx_id };
-                                let _ = sender.send(msg).await;
                             }
                         }
 

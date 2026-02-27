@@ -11,19 +11,22 @@ use tracing::{error, info};
 const PUT_FREQUENCY: usize = 20;
 const TRI_PUT_FREQUENCY: usize = 20;
 
+const NETWORKING_THREADS: usize = 4;
+const OPERATIONS_THREADS: usize = 4;
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     // runtime for network layer
     let net_rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
+        .worker_threads(NETWORKING_THREADS)
         .thread_name("net")
         .enable_all()
         .build()?;
 
     // runtime for operations layer
     let ops_rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
+        .worker_threads(OPERATIONS_THREADS)
         .thread_name("ops")
         .enable_all()
         .build()?;

@@ -2,7 +2,7 @@ use super::NodeId;
 use super::PeerMessage;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, hash::Hash, time::Duration};
+use std::{collections::HashMap, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -19,22 +19,6 @@ pub struct ReadyPeerMessage(NodeId);
 pub struct Peers<K: Clone, V: Clone> {
     pub inbox: mpsc::Receiver<(NodeId, PeerMessage<K, V>)>,
     pub senders: HashMap<NodeId, mpsc::Sender<PeerMessage<K, V>>>,
-}
-
-impl<K, V> Peers<K, V>
-where
-    K: Send + Sync + 'static + Hash + Clone,
-    V: Send + Sync + 'static + Clone,
-{
-    // send message to single node
-    pub async fn send(&self, to: &NodeId, msg: PeerMessage<K, V>) -> Result<()> {
-        let sender = self
-            .senders
-            .get(to)
-            .ok_or_else(|| anyhow!("unknown peer: {}", to))?;
-        sender.send(msg).await?;
-        Ok(())
-    }
 }
 
 async fn writer_task<K, V>(
@@ -109,6 +93,7 @@ where
 pub async fn connect_all<K, V>(
     my_name: &str,
     sunlab_nodes: &Vec<String>,
+    net_handle: &tokio::runtime::Handle,
 ) -> Result<(Peers<K, V>, Vec<NodeId>, NodeId)>
 where
     K: Serialize + for<'de> Deserialize<'de> + std::marker::Send + Sync + 'static + Clone,
@@ -124,7 +109,7 @@ where
     // Spawn acceptor task
     let accept_sender = conn_sender.clone();
     let my_name_owned = my_name.to_string();
-    tokio::spawn(async move {
+    net_handle.spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((mut stream, addr)) => {
@@ -164,7 +149,7 @@ where
         let my_node_id = my_node_id.clone();
         let my_name = my_name.clone();
 
-        tokio::spawn(async move {
+        net_handle.spawn(async move {
             let peer_id = node_to_index(&peer_name).expect("invalid peer name");
             let peer_node_id = NodeId {
                 sunlab_name: peer_name.clone(),
@@ -220,11 +205,12 @@ where
         // Reader task: recv from socket -> inbox
         let inbox_sender = inbox_sender.clone();
         let peer_id_clone = peer_id.clone();
-        tokio::spawn(async move { reader_task(peer_id_clone, read_half, inbox_sender).await });
+        net_handle.spawn(async move { reader_task(peer_id_clone, read_half, inbox_sender).await });
 
         // Writer task: outbox -> send to socket
         let peer_id_clone = peer_id.clone();
-        tokio::spawn(async move { writer_task(peer_id_clone, write_half, outbox_receiver).await });
+        net_handle
+            .spawn(async move { writer_task(peer_id_clone, write_half, outbox_receiver).await });
 
         senders.insert(peer_id, outbox_sender);
     }

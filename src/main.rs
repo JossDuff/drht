@@ -11,11 +11,35 @@ use tracing::{error, info};
 const PUT_FREQUENCY: usize = 20;
 const TRI_PUT_FREQUENCY: usize = 20;
 
-#[tokio::main(worker_threads = 4)]
-async fn main() -> Result<()> {
-    // init logger
+fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
+    // runtime for network layer
+    let net_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_name("net")
+        .enable_all()
+        .build()?;
+
+    // runtime for operations layer
+    let ops_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_name("ops")
+        .enable_all()
+        .build()?;
+
+    // handle is used to spawn tasks on this runtime
+    let net_handle = net_rt.handle().clone();
+
+    // start the application
+    let handle = ops_rt.spawn(async move { run(net_handle).await });
+
+    // wait for it to finish
+    ops_rt.block_on(handle)??;
+    Ok(())
+}
+
+async fn run(net_handle: tokio::runtime::Handle) -> Result<()> {
     let config = Config::parse();
     let num_keys = config.num_keys;
     let key_range = config.key_range;
@@ -24,7 +48,8 @@ async fn main() -> Result<()> {
     info!("I will connect to {:?}", config.connections);
 
     // make initial connections
-    let (node, sender) = Node::<u64, u8>::new(config).await?;
+    // net_handle gets passed through this into the networking task
+    let (node, sender) = Node::<u64, u8>::new(config, &net_handle).await?;
 
     // run the node event handlers in their own task
     let node_handle = tokio::spawn(async move {

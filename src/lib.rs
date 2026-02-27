@@ -215,7 +215,10 @@ where
         + Copy,
     V: Send + Sync + 'static + Debug + Serialize + for<'de> Deserialize<'de> + Clone,
 {
-    pub async fn new(config: Config) -> Result<(Self, mpsc::Sender<LocalMessage<K, V>>)> {
+    pub async fn new(
+        config: Config,
+        net_handle: &tokio::runtime::Handle,
+    ) -> Result<(Self, mpsc::Sender<LocalMessage<K, V>>)> {
         let db = StripedDb::new(config.stripes);
         let awaiting_put_response: Arc<Mutex<HashMap<u64, oneshot::Sender<bool>>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -228,7 +231,7 @@ where
 
         // this is a barrier
         let (peers, cluster, my_node_id): (Peers<K, V>, Vec<NodeId>, NodeId) =
-            connect_all::<K, V>(&config.name, &config.connections).await?;
+            connect_all::<K, V>(&config.name, &config.connections, net_handle).await?;
 
         // for sending/ receiving messages from the test harness
         let (local_sender, local_inbox) = mpsc::channel(CHANNEL_BUFFER_SIZE);
@@ -315,11 +318,9 @@ where
                 let replicas = s.get_key_replicas(&key);
                 let primary_replica = replicas
                     .first()
-                    .ok_or(anyhow!("Key {:?} doesn't have any replicas!", key))?
-                    .clone()
-                    .clone();
+                    .ok_or(anyhow!("Key {:?} doesn't have any replicas!", key))?;
 
-                if primary_replica == s.my_node_id {
+                if **primary_replica == s.my_node_id {
                     let db = s.db.clone();
                     tokio::spawn(async move {
                         let resp = db.get(&key).await;

@@ -263,9 +263,6 @@ where
     }
 
     // Split into two independent tasks, each with its own receiver.
-    //
-    // The local task can freely `.await` on sends to peers without blocking
-    // the peer task from draining its inbox
     pub async fn run(self) -> Result<()> {
         let shared_local = self.shared.clone();
         let shared_peer = self.shared.clone();
@@ -332,8 +329,7 @@ where
                     let req_id: u64 = rand::rng().random();
                     let request: PeerMessage<K, V> = PeerMessage::Get { key, req_id };
 
-                    // Register the response channel BEFORE sending so there's
-                    // no race with the reply arriving first.
+                    // register reciever
                     let (get_sender, get_receiver) = oneshot::channel();
                     {
                         let mut awaiting = s.awaiting_get_response.lock().await;
@@ -387,7 +383,7 @@ where
                     let req_id: u64 = rand::rng().random();
                     let req = PeerMessage::Put { pair, req_id };
 
-                    // Register BEFORE sending
+                    // register response receiver
                     let (put_sender, put_receiver) = oneshot::channel();
                     {
                         let mut awaiting = s.awaiting_put_response.lock().await;
@@ -455,8 +451,7 @@ where
                 let num_remote = remote_primaries.len();
                 let (vote_tx, mut vote_rx) = mpsc::channel(num_remote.max(1));
 
-                // Register vote channel BEFORE sending Prepare to avoid
-                // race where VotePrepared arrives before registration
+                // register response channel
                 if !remote_primaries.is_empty() {
                     debug!("Getting lock on awaiting_votes for {tx_id}");
                     s.awaiting_votes.lock().await.insert(tx_id, vote_tx);
@@ -472,7 +467,8 @@ where
                 let replication_degree = s.replication_degree;
                 let all_senders = s.senders.clone();
 
-                // Spawn coordinator task — handles local prepare, sends
+                // Spawn coordinator task
+                // handles local prepare, sends
                 // Prepare, and waits for votes without blocking the
                 // local loop
                 tokio::spawn(async move {
@@ -521,14 +517,14 @@ where
                         true // no local entries to prepare
                     };
 
-                    // ── Send Prepare to remote primaries ─────────────
+                    // Send Prepare to remote primaries
                     for (primary, msg) in &remote_prepare_msgs {
                         if let Some(sender) = all_senders.get(primary) {
                             let _ = sender.send(msg.clone()).await;
                         }
                     }
 
-                    // ── Collect remote votes (with timeout) ──────────
+                    // Collect remote votes (with timeout)
                     // true if we receive enough votes, false otherwise
                     let remote_ok = if num_remote == 0 {
                         true
@@ -672,7 +668,7 @@ where
     while let Some((from, msg)) = inbox.recv().await {
         debug!("Got {:?} from {}", msg, from);
         match msg {
-            // ── peer asks us for a GET (we're primary) ───────────────
+            // peer asks us for a GET (we're primary)
             PeerMessage::Get { key, req_id } => {
                 let db = s.db.clone();
                 let senders = s.senders.clone();
@@ -688,7 +684,7 @@ where
                 });
             }
 
-            // ── peer asks us for a PUT (we're primary) ───────────────
+            // peer asks us for a PUT (we're primary)
             PeerMessage::Put { pair, req_id } => {
                 let db = s.db.clone();
                 let my_node_id = s.my_node_id.clone();
@@ -723,7 +719,7 @@ where
                 });
             }
 
-            // ── replica put from primary ─────────────────────────────
+            // replica put from primary
             PeerMessage::ReplicaPut { pair } => {
                 let db = s.db.clone();
                 tokio::spawn(async move {
@@ -731,7 +727,7 @@ where
                 });
             }
 
-            // ── response to our earlier GET request ──────────────────
+            // response to our earlier GET request
             PeerMessage::GetResponse { val, req_id } => {
                 let mut awaiting = s.awaiting_get_response.lock().await;
                 match awaiting.remove(&req_id) {
@@ -746,7 +742,7 @@ where
                 };
             }
 
-            // ── response to our earlier PUT request ──────────────────
+            // response to our earlier PUT request
             PeerMessage::PutResponse { success, req_id } => {
                 let mut awaiting = s.awaiting_put_response.lock().await;
                 match awaiting.remove(&req_id) {
@@ -761,14 +757,14 @@ where
                 };
             }
 
-            // ── 2PC: abort from coordinator ──────────────────────────
+            // 2PC: abort from coordinator
             PeerMessage::Abort { tx_id } => {
                 debug!("2pc abort: Received Abort from coordinator for tx_id {tx_id}, removing from pending_prepares...");
                 s.pending_prepares.lock().await.remove(&tx_id);
                 debug!("2pc abort: Successfully removed {tx_id} from pending_prepares");
             }
 
-            // ── 2PC: prepare from coordinator (we're a participant) ──
+            // 2PC: prepare from coordinator
             PeerMessage::Prepare { pairs, tx_id } => {
                 let db = s.db.clone();
                 let pending_prepares = s.pending_prepares.clone();
@@ -826,7 +822,7 @@ where
                 });
             }
 
-            // ── 2PC: vote responses (we're coordinator) ──────────────
+            // 2PC: vote responses (we're coordinator)
             PeerMessage::VotePrepared { tx_id } => {
                 let tx = {
                     debug!("2pc voteprepated: getting lock on awaiting_votes for {tx_id}...");
@@ -854,7 +850,7 @@ where
                 }
             }
 
-            // ── 2PC: commit from coordinator ─────────────────────────
+            // 2PC: commit from coordinator
             PeerMessage::Commit { tx_id } => {
                 debug!("Attempting to commit {tx_id}");
                 let pending_prepares = s.pending_prepares.clone();
@@ -896,7 +892,7 @@ where
                 });
             }
 
-            // ── peer finished their test ─────────────────────────────
+            // peer finished their test
             PeerMessage::Done => {
                 info!("{} is done with their test", from);
                 s.mark_done();

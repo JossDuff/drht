@@ -24,7 +24,7 @@ async fn main() -> Result<()> {
     info!("I will connect to {:?}", config.connections);
 
     // make initial connections
-    let (mut node, sender) = Node::<u64, u8>::new(config).await?;
+    let (node, sender) = Node::<u64, u8>::new(config).await?;
 
     // run the node event handlers in their own task
     let node_handle = tokio::spawn(async move {
@@ -137,7 +137,6 @@ async fn main() -> Result<()> {
 
     node_handle.await?;
 
-    // TODO: graceful, non-janky exit
     std::process::exit(0);
 }
 

@@ -22,7 +22,7 @@ use tokio::sync::OwnedMutexGuard;
 use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use tracing::{debug, error, info, warn};
 
-const CHANNEL_BUFFER_SIZE: usize = 4;
+const CHANNEL_BUFFER_SIZE: usize = 64;
 const COORDINATOR_VOTE_TIMEOUT: Duration = Duration::from_millis(200);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -41,8 +41,10 @@ Commands:
 
 Options:
   -n <num>      Number of nodes to use (required for 'run' and 'exec')
-  -k <num>      Number of keys for benchmark (passed to dht)
-  -r <num>      Key range for benchmark (passed to dht)
+  -k <num>      Number of keys for benchmark (default: 1000000)
+  -r <num>      Key range for benchmark (default: 1000)
+  -R <num>      Replication degree - how many nodes hold each key (default: 2)
+  -s <num>      Number of locked sections in the database (default: 256)
   -d <dir>      Project directory (default: current directory)
   -v            Enable debug logging (RUST_LOG=debug instead of info)
   -h, --help    Show this help
@@ -53,8 +55,9 @@ Examples:
   sun.sh run -n 3 -v                   Run with debug logging
   sun.sh run -n 3 -k 100000
   sun.sh run -n 3 -k 100000 -r 1000
-  sun.sh run -n 3 -- --keys 1000 --ops 50000
-  sun.sh run -n 5 -d ~/dev/cse476/project -- --config config.toml
+  sun.sh run -n 3 -R 3                 Run with replication degree 3
+  sun.sh run -n 3 -s 512               Run with 512 stripes
+  sun.sh run -n 3 -- --extra-flag
   sun.sh exec -n 3 -- hostname
   sun.sh exec -n 5 -- "cd ~/dev/project && ./my_script.sh"
   sun.sh kill                          Kill 'dht' on all nodes
@@ -289,8 +292,10 @@ cmd_run() {
     local project_dir="$2"
     local num_keys="$3"
     local key_range="$4"
-    local rust_log="$5"
-    shift 5
+    local replication_degree="$5"
+    local stripes="$6"
+    local rust_log="$7"
+    shift 7
     local program_args="$*"
 
     echo -e "${GREEN}=== Running on Cluster ===${NC}"
@@ -311,6 +316,12 @@ cmd_run() {
     fi
     if [[ -n "$key_range" ]]; then
         echo -e "Key range: ${BLUE}$key_range${NC}"
+    fi
+    if [[ -n "$replication_degree" ]]; then
+        echo -e "Replication: ${BLUE}$replication_degree${NC}"
+    fi
+    if [[ -n "$stripes" ]]; then
+        echo -e "Stripes: ${BLUE}$stripes${NC}"
     fi
     if [[ -n "$program_args" ]]; then
         echo -e "Extra args: ${BLUE}$program_args${NC}"
@@ -359,6 +370,12 @@ cmd_run() {
         fi
         if [[ -n "$key_range" ]]; then
             cmd="$cmd --key-range $key_range"
+        fi
+        if [[ -n "$replication_degree" ]]; then
+            cmd="$cmd --repication-degree $replication_degree"
+        fi
+        if [[ -n "$stripes" ]]; then
+            cmd="$cmd --stripes $stripes"
         fi
         if [[ -n "$program_args" ]]; then
             cmd="$cmd $program_args"
@@ -434,6 +451,8 @@ NUM_NODES=""
 PROJECT_DIR="$(pwd)"
 NUM_KEYS=""
 KEY_RANGE=""
+REPLICATION_DEGREE=""
+STRIPES=""
 RUST_LOG="info"
 EXTRA_ARGS=""
 
@@ -449,6 +468,14 @@ while [[ $# -gt 0 ]]; do
         ;;
     -r)
         KEY_RANGE="$2"
+        shift 2
+        ;;
+    -R)
+        REPLICATION_DEGREE="$2"
+        shift 2
+        ;;
+    -s)
+        STRIPES="$2"
         shift 2
         ;;
     -d)
@@ -488,7 +515,7 @@ run)
         echo -e "${RED}Error: Number of nodes must be a positive integer${NC}"
         exit 1
     fi
-    cmd_run "$NUM_NODES" "$PROJECT_DIR" "$NUM_KEYS" "$KEY_RANGE" "$RUST_LOG" $EXTRA_ARGS
+    cmd_run "$NUM_NODES" "$PROJECT_DIR" "$NUM_KEYS" "$KEY_RANGE" "$REPLICATION_DEGREE" "$STRIPES" "$RUST_LOG" $EXTRA_ARGS
     ;;
 exec)
     if [[ -z "$NUM_NODES" ]]; then

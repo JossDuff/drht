@@ -1,14 +1,18 @@
 mod config;
 mod db;
+mod handlers;
 mod messages;
 mod net;
 
 use anyhow::{anyhow, Result};
 pub use config::Config;
 use db::StripedDb;
+use handlers::{
+    handle_local_get, handle_local_put, handle_local_triput, handle_peer_commit,
+    handle_peer_prepare, handle_peer_put,
+};
 pub use messages::{LocalMessage, PeerMessage};
 use net::{connect_all, Peers};
-use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{hash_map::DefaultHasher, HashMap},
@@ -25,7 +29,7 @@ use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use tracing::{debug, error, info, warn};
 
 const CHANNEL_BUFFER_SIZE: usize = 64;
-const COORDINATOR_VOTE_TIMEOUT: Duration = Duration::from_millis(200);
+pub(crate) const COORDINATOR_VOTE_TIMEOUT: Duration = Duration::from_millis(200);
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct KVPair<K, V>
@@ -49,25 +53,25 @@ impl fmt::Display for NodeId {
     }
 }
 
-struct PendingTx<K: Clone, V: Clone> {
-    pairs: Vec<(KVPair<K, V>, usize)>, // (pair, stripe_index)
-    guards: HashMap<usize, OwnedMutexGuard<HashMap<K, V>>>,
+pub(crate) struct PendingTx<K: Clone, V: Clone> {
+    pub(crate) pairs: Vec<(KVPair<K, V>, usize)>, // (pair, stripe_index)
+    pub(crate) guards: HashMap<usize, OwnedMutexGuard<HashMap<K, V>>>,
 }
 
 // Shared state accessible by both tasks: local message handler and peer message handler
-struct Shared<K: Clone, V: Clone> {
-    senders: HashMap<NodeId, mpsc::Sender<PeerMessage<K, V>>>,
-    cluster: Vec<NodeId>,
-    my_node_id: NodeId,
-    replication_degree: usize,
-    db: StripedDb<K, V>,
-    awaiting_put_response: Arc<Mutex<HashMap<u64, oneshot::Sender<bool>>>>,
-    awaiting_get_response: Arc<Mutex<HashMap<u64, oneshot::Sender<Option<V>>>>>,
-    pending_prepares: Arc<Mutex<HashMap<u64, PendingTx<K, V>>>>,
-    awaiting_votes: Arc<Mutex<HashMap<u64, mpsc::Sender<bool>>>>,
-    done_count: AtomicUsize,
+pub(crate) struct Shared<K: Clone, V: Clone> {
+    pub(crate) senders: HashMap<NodeId, mpsc::Sender<PeerMessage<K, V>>>,
+    pub(crate) cluster: Vec<NodeId>,
+    pub(crate) my_node_id: NodeId,
+    pub(crate) replication_degree: usize,
+    pub(crate) db: StripedDb<K, V>,
+    pub(crate) awaiting_put_response: Arc<Mutex<HashMap<u64, oneshot::Sender<bool>>>>,
+    pub(crate) awaiting_get_response: Arc<Mutex<HashMap<u64, oneshot::Sender<Option<V>>>>>,
+    pub(crate) pending_prepares: Arc<Mutex<HashMap<u64, PendingTx<K, V>>>>,
+    pub(crate) awaiting_votes: Arc<Mutex<HashMap<u64, mpsc::Sender<bool>>>>,
+    pub(crate) done_count: AtomicUsize,
     // signaled when done_count reaches cluster.len()
-    shutdown: Notify,
+    pub(crate) shutdown: Notify,
 }
 
 impl<K, V> Shared<K, V>
@@ -86,14 +90,14 @@ where
     V: Send + Sync + 'static + Debug + Serialize + for<'de> Deserialize<'de> + Clone,
 {
     // Increment done_count and signal shutdown if all nodes are done.
-    fn mark_done(&self) {
+    pub(crate) fn mark_done(&self) {
         let count = self.done_count.fetch_add(1, Ordering::SeqCst) + 1;
         if count >= self.cluster.len() {
             self.shutdown.notify_waiters();
         }
     }
 
-    fn get_key_replicas(&self, key: &K) -> Vec<&NodeId> {
+    pub(crate) fn get_key_replicas(&self, key: &K) -> Vec<&NodeId> {
         key_replica_indices(key, self.cluster.len(), self.replication_degree)
             .into_iter()
             .map(|i| &self.cluster[i])
@@ -103,7 +107,7 @@ where
     // Send a message to a peer.  Awaits until the bounded channel has space.
     // This is fine because each task has its own receiver — a blocked send
     // here can never prevent the *other* task from draining its inbox.
-    async fn send_to_peer(&self, target: &NodeId, msg: PeerMessage<K, V>) -> Result<()> {
+    pub(crate) async fn send_to_peer(&self, target: &NodeId, msg: PeerMessage<K, V>) -> Result<()> {
         if let Some(sender) = self.senders.get(target) {
             sender
                 .send(msg)
@@ -239,322 +243,20 @@ where
                 key,
                 response_sender,
             } => {
-                let replicas = s.get_key_replicas(&key);
-                let primary_replica = replicas
-                    .first()
-                    .ok_or(anyhow!("Key {:?} doesn't have any replicas!", key))?;
-
-                if **primary_replica == s.my_node_id {
-                    let db = s.db.clone();
-                    tokio::spawn(async move {
-                        let resp = db.get(&key).await;
-                        let _ = response_sender.send(resp);
-                    });
-                } else {
-                    let req_id: u64 = rand::rng().random();
-                    let request: PeerMessage<K, V> = PeerMessage::Get { key, req_id };
-
-                    // register reciever
-                    let (get_sender, get_receiver) = oneshot::channel();
-                    {
-                        let mut awaiting = s.awaiting_get_response.lock().await;
-                        awaiting.insert(req_id, get_sender);
-                    }
-
-                    // This .await may block if the peer's channel is full.
-                    s.send_to_peer(&primary_replica, request).await?;
-
-                    tokio::spawn(async move {
-                        match get_receiver.await {
-                            Ok(peer_get_response) => {
-                                let _ = response_sender.send(peer_get_response);
-                            }
-                            Err(e) => {
-                                error!("Receive error waiting for getResponse: {}", e);
-                            }
-                        }
-                    });
-                }
+                handle_local_get(&s, key, response_sender).await?;
             }
             LocalMessage::Put {
                 pair,
                 response_sender,
             } => {
-                let key = pair.key;
-                let val = pair.val.clone();
-
-                let replicas: Vec<NodeId> = s.get_key_replicas(&key).into_iter().cloned().collect();
-                let primary_replica = replicas
-                    .first()
-                    .ok_or(anyhow!("Key {:?} doesn't have any replicas!", key))?
-                    .clone();
-
-                if primary_replica == s.my_node_id {
-                    let db = s.db.clone();
-                    let my_node_id = s.my_node_id.clone();
-                    let senders = s.senders.clone();
-                    tokio::spawn(async move {
-                        db.put(key, val).await;
-                        let _ = response_sender.send(true);
-
-                        let req = PeerMessage::ReplicaPut { pair };
-                        for replica in replicas.iter().filter(|x| **x != my_node_id) {
-                            if let Some(sender) = senders.get(replica) {
-                                let _ = sender.send(req.clone()).await;
-                            }
-                        }
-                    });
-                } else {
-                    let req_id: u64 = rand::rng().random();
-                    let req = PeerMessage::Put { pair, req_id };
-
-                    // register response receiver
-                    let (put_sender, put_receiver) = oneshot::channel();
-                    {
-                        let mut awaiting = s.awaiting_put_response.lock().await;
-                        awaiting.insert(req_id, put_sender);
-                    }
-
-                    s.send_to_peer(&primary_replica, req).await?;
-
-                    tokio::spawn(async move {
-                        match put_receiver.await {
-                            Ok(peer_put_response) => {
-                                let _ = response_sender.send(peer_put_response);
-                            }
-                            Err(e) => {
-                                error!("Receive error waiting for putResponse: {}", e);
-                            }
-                        }
-                    });
-                }
+                handle_local_put(&s, pair, response_sender).await?;
             }
             // This node is the coordinator for the TRIPUT
             LocalMessage::TriPut {
                 pairs,
                 response_sender,
             } => {
-                let tx_id: u64 = rand::rng().random();
-
-                // Group pairs by primary, precompute stripe indices
-                let mut primary_to_entries: HashMap<NodeId, Vec<(KVPair<K, V>, usize)>> =
-                    HashMap::new();
-                for pair in pairs {
-                    let primary = s.get_key_replicas(&pair.key)[0].clone();
-                    let stripe_idx = s.db.stripe_index(&pair.key);
-                    primary_to_entries
-                        .entry(primary)
-                        .or_default()
-                        .push((pair, stripe_idx));
-                }
-
-                // Extract local entries (if any) — handled inline in
-                // the coordinator task to avoid a race where the
-                // coordinator aborts before a separately-spawned local
-                // prepare inserts its guards, orphaning stripe locks.
-                let local_entries = primary_to_entries.remove(&s.my_node_id);
-
-                // Compute remote primaries and build prepare messages
-                let remote_primaries: Vec<NodeId> = primary_to_entries.keys().cloned().collect();
-                let remote_prepare_msgs: Vec<(NodeId, PeerMessage<K, V>)> = primary_to_entries
-                    .iter()
-                    .map(|(primary, entries)| {
-                        let pairs_only: Vec<KVPair<K, V>> =
-                            entries.iter().map(|(p, _)| p.clone()).collect();
-                        (
-                            primary.clone(),
-                            PeerMessage::Prepare {
-                                pairs: pairs_only,
-                                tx_id,
-                            },
-                        )
-                    })
-                    .collect();
-
-                // Vote channel only carries remote votes; local result
-                // is known synchronously inside the coordinator task.
-                let num_remote = remote_primaries.len();
-                let (vote_tx, mut vote_rx) = mpsc::channel(num_remote.max(1));
-
-                // register response channel
-                if !remote_primaries.is_empty() {
-                    debug!("Getting lock on awaiting_votes for {tx_id}");
-                    s.awaiting_votes.lock().await.insert(tx_id, vote_tx);
-                    debug!("Added {} to awaiting_votes", tx_id);
-                }
-
-                // Clone everything the spawned coordinator task needs
-                let db = s.db.clone();
-                let pending_prepares = s.pending_prepares.clone();
-                let awaiting_votes = s.awaiting_votes.clone();
-                let my_node_id = s.my_node_id.clone();
-                let cluster = s.cluster.clone();
-                let replication_degree = s.replication_degree;
-                let all_senders = s.senders.clone();
-
-                // Spawn coordinator task
-                // handles local prepare, sends
-                // Prepare, and waits for votes without blocking the
-                // local loop
-                tokio::spawn(async move {
-                    // ── Local prepare (inline, no separate spawn) ─────
-                    let local_voted = if let Some(mut entries) = local_entries {
-                        entries.sort_by_key(|(_, idx)| *idx);
-
-                        let mut guards: HashMap<usize, OwnedMutexGuard<HashMap<K, V>>> =
-                            HashMap::new();
-                        let mut lock_failed = false;
-                        for (pair, idx) in &entries {
-                            if !guards.contains_key(idx) {
-                                let stripe = db.get_stripe_by_index(*idx);
-                                match stripe.try_lock_owned() {
-                                    Ok(guard) => {
-                                        debug!(
-                                            "Local prepare try_lock successful for stripe index {}, key {:?}, tx {}",
-                                            idx, pair.key, tx_id
-                                        );
-                                        guards.insert(*idx, guard);
-                                    }
-                                    Err(_) => {
-                                        debug!("Local prepare try_lock failed for stripe index {}, key {:?}, tx {}", idx, pair.key,tx_id);
-                                        lock_failed = true;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-
-                        if lock_failed {
-                            false
-                        } else {
-                            debug!("Getting lock on pending_prepares for {tx_id}");
-                            pending_prepares.lock().await.insert(
-                                tx_id,
-                                PendingTx {
-                                    pairs: entries,
-                                    guards,
-                                },
-                            );
-                            debug!("Added {tx_id} to pending_prepares");
-                            true
-                        }
-                    } else {
-                        true // no local entries to prepare
-                    };
-
-                    // Send Prepare to remote primaries
-                    for (primary, msg) in &remote_prepare_msgs {
-                        if let Some(sender) = all_senders.get(primary) {
-                            let _ = sender.send(msg.clone()).await;
-                        }
-                    }
-
-                    // Collect remote votes (with timeout)
-                    // true if we receive enough votes, false otherwise
-                    let remote_ok = if num_remote == 0 {
-                        true
-                    } else {
-                        // true if we receive enough votes, false otherwise
-                        let collect_result =
-                            tokio::time::timeout(COORDINATOR_VOTE_TIMEOUT, async {
-                                for _ in 0..num_remote {
-                                    match vote_rx.recv().await {
-                                        Some(true) => {}
-                                        _ => return false,
-                                    }
-                                }
-                                true
-                            })
-                            .await;
-                        if let Ok(true) = collect_result {
-                            debug!("Got enough remote votes for tri_put tx {}", tx_id);
-                            true
-                        } else {
-                            debug!("Did not get enough remote votes for tri_put tx {}", tx_id);
-                            false
-                        }
-                    };
-
-                    debug!("Getting lock on awaiting_votes for {tx_id}");
-                    awaiting_votes.lock().await.remove(&tx_id);
-                    debug!("Removed {} from awaiting_votes", tx_id);
-
-                    let all_prepared = local_voted && remote_ok;
-
-                    if all_prepared {
-                        // Apply local changes (if any) and collect pairs to replicate
-                        let local_to_replicate = {
-                            let mut pending = pending_prepares.lock().await;
-                            if let Some(mut tx) = pending.remove(&tx_id) {
-                                debug!("removed {} from pending_prepares", tx_id);
-                                for (pair, stripe_idx) in &tx.pairs {
-                                    if let Some(guard) = tx.guards.get_mut(stripe_idx) {
-                                        debug!(
-                                            "Inserting key {:?}, val {:?} for tx {} into guard",
-                                            pair.key,
-                                            pair.val.clone(),
-                                            tx_id
-                                        );
-                                        guard.insert(pair.key, pair.val.clone());
-                                    } else {
-                                        warn!(
-                                            "stripe {} not found in guards for tx {}",
-                                            stripe_idx, tx_id
-                                        );
-                                    }
-                                }
-                                let to_replicate: Vec<KVPair<K, V>> =
-                                    tx.pairs.iter().map(|(p, _)| p.clone()).collect();
-                                Some(to_replicate)
-                            } else {
-                                None
-                            }
-                        };
-
-                        // Send Commit BEFORE ReplicaPut so remote
-                        // participants release their locks promptly
-                        for primary in &remote_primaries {
-                            if let Some(sender) = all_senders.get(primary) {
-                                let msg = PeerMessage::Commit { tx_id };
-                                let _ = sender.send(msg).await;
-                            }
-                        }
-
-                        // Replicate local entries to non-primary replicas
-                        if let Some(to_replicate) = local_to_replicate {
-                            for pair in to_replicate {
-                                let replicas = key_replica_indices(
-                                    &pair.key,
-                                    cluster.len(),
-                                    replication_degree,
-                                );
-                                for r_idx in replicas {
-                                    let replica = &cluster[r_idx];
-                                    if *replica != my_node_id {
-                                        if let Some(sender) = all_senders.get(replica) {
-                                            let msg =
-                                                PeerMessage::ReplicaPut { pair: pair.clone() };
-                                            let _ = sender.send(msg).await;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        let _ = response_sender.send(true);
-                    } else {
-                        pending_prepares.lock().await.remove(&tx_id);
-
-                        for primary in &remote_primaries {
-                            if let Some(sender) = all_senders.get(primary) {
-                                let msg = PeerMessage::Abort { tx_id };
-                                let _ = sender.send(msg).await;
-                            }
-                        }
-
-                        let _ = response_sender.send(false);
-                    }
-                });
+                handle_local_triput(&s, pairs, response_sender).await;
             }
             LocalMessage::Done => {
                 info!("I am done with my tests, notifying peers");
@@ -611,37 +313,7 @@ where
 
             // peer asks us for a PUT (we're primary)
             PeerMessage::Put { pair, req_id } => {
-                let db = s.db.clone();
-                let my_node_id = s.my_node_id.clone();
-                let cluster = s.cluster.clone();
-                let replication_degree = s.replication_degree;
-                let senders = s.senders.clone();
-                tokio::spawn(async move {
-                    let key = pair.key;
-                    let val = pair.val.clone();
-                    let result = db.put(key, val).await;
-                    let resp: PeerMessage<K, V> = PeerMessage::PutResponse {
-                        success: result,
-                        req_id,
-                    };
-
-                    // Send PutResponse BEFORE ReplicaPut so the requester
-                    // isn't blocked waiting behind replica writes
-                    if let Some(sender) = senders.get(&from) {
-                        let _ = sender.send(resp).await;
-                    }
-
-                    let replicas = key_replica_indices(&key, cluster.len(), replication_degree);
-                    let req = PeerMessage::ReplicaPut { pair };
-                    for r_idx in &replicas {
-                        let replica = &cluster[*r_idx];
-                        if *replica != my_node_id {
-                            if let Some(sender) = senders.get(replica) {
-                                let _ = sender.send(req.clone()).await;
-                            }
-                        }
-                    }
-                });
+                handle_peer_put(&s, from, pair, req_id);
             }
 
             // replica put from primary
@@ -691,60 +363,7 @@ where
 
             // 2PC: prepare from coordinator
             PeerMessage::Prepare { pairs, tx_id } => {
-                let db = s.db.clone();
-                let pending_prepares = s.pending_prepares.clone();
-                let senders = s.senders.clone();
-                tokio::spawn(async move {
-                    let mut entries: Vec<(KVPair<K, V>, usize)> = pairs
-                        .iter()
-                        .map(|p| (p.clone(), db.stripe_index(&p.key)))
-                        .collect();
-                    entries.sort_by_key(|(_, idx)| *idx);
-
-                    let mut guards: HashMap<usize, OwnedMutexGuard<HashMap<K, V>>> = HashMap::new();
-                    let mut lock_failed = false;
-                    for (_, idx) in &entries {
-                        if !guards.contains_key(idx) {
-                            let stripe = db.get_stripe_by_index(*idx);
-                            match stripe.try_lock_owned() {
-                                Ok(guard) => {
-                                    debug!("Inserting stripe index {idx} to guard for tx {tx_id}");
-                                    guards.insert(*idx, guard);
-                                }
-                                Err(_) => {
-                                    debug!(
-                                        "2PC prepare: Prepare try_lock failed for tx {} on stripe {}",
-                                        tx_id, idx
-                                    );
-                                    lock_failed = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    if lock_failed {
-                        if let Some(sender) = senders.get(&from) {
-                            let resp = PeerMessage::VoteAbort { tx_id };
-                            let _ = sender.send(resp).await;
-                        }
-                    } else {
-                        debug!("2pc prepare: getting lock on pending_prepares for {tx_id}");
-                        pending_prepares.lock().await.insert(
-                            tx_id,
-                            PendingTx {
-                                pairs: entries,
-                                guards,
-                            },
-                        );
-                        debug!("2PC prepare: Adding tx {tx_id} to pending_prepares");
-
-                        if let Some(sender) = senders.get(&from) {
-                            let resp = PeerMessage::VotePrepared { tx_id };
-                            let _ = sender.send(resp).await;
-                        }
-                    }
-                });
+                handle_peer_prepare(&s, from, pairs, tx_id);
             }
 
             // 2PC: vote responses (we're coordinator)
@@ -777,44 +396,7 @@ where
 
             // 2PC: commit from coordinator
             PeerMessage::Commit { tx_id } => {
-                debug!("Attempting to commit {tx_id}");
-                let pending_prepares = s.pending_prepares.clone();
-                let my_node_id = s.my_node_id.clone();
-                let cluster = s.cluster.clone();
-                let replication_degree = s.replication_degree;
-                let senders = s.senders.clone();
-                tokio::spawn(async move {
-                    debug!("2pc commit: getting lock on pending_prepares for {tx_id}...");
-                    let mut pending = pending_prepares.lock().await;
-                    debug!("2pc commit: got lock on pending_prepares for {tx_id}");
-                    if let Some(mut tx) = pending.remove(&tx_id) {
-                        for (pair, stripe_idx) in &tx.pairs {
-                            if let Some(guard) = tx.guards.get_mut(stripe_idx) {
-                                guard.insert(pair.key, pair.val.clone());
-                            }
-                        }
-
-                        let to_replicate: Vec<KVPair<K, V>> =
-                            tx.pairs.iter().map(|(p, _)| p.clone()).collect();
-
-                        drop(tx);
-                        drop(pending);
-
-                        for pair in to_replicate {
-                            let replicas =
-                                key_replica_indices(&pair.key, cluster.len(), replication_degree);
-                            for r_idx in replicas {
-                                let replica = &cluster[r_idx];
-                                if *replica != my_node_id {
-                                    if let Some(sender) = senders.get(replica) {
-                                        let msg = PeerMessage::ReplicaPut { pair: pair.clone() };
-                                        let _ = sender.send(msg).await;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                });
+                handle_peer_commit(&s, tx_id);
             }
 
             // peer finished their test
@@ -830,7 +412,7 @@ where
 
 // Pure function: given a sorted cluster and replication degree, return the
 // indices of nodes that own this key.
-fn key_replica_indices<K: Hash>(
+pub(crate) fn key_replica_indices<K: Hash>(
     key: &K,
     cluster_len: usize,
     replication_degree: usize,

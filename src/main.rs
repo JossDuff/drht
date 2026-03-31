@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use dht::KVPair;
 use dht::{Config, LocalMessage, Node};
-use rand::Rng;
+use rand::{rngs::ThreadRng, Rng};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use tracing::{error, info};
@@ -183,18 +183,21 @@ fn generate_test_operations(num_operations: usize, key_range: u64) -> Vec<Operat
                     },
                 }
             } else if roll < total {
+                let k1 = rng.random_range(0..key_range);
+                let k2 = unique_random(k1, k1, &mut rng, key_range);
+                let k3 = unique_random(k1, k2, &mut rng, key_range);
                 Operation::TriPut {
                     pairs: [
                         KVPair {
-                            key: rng.random_range(0..key_range),
+                            key: k1,
                             val: rng.random(),
                         },
                         KVPair {
-                            key: rng.random_range(0..key_range),
+                            key: k2,
                             val: rng.random(),
                         },
                         KVPair {
-                            key: rng.random_range(0..key_range),
+                            key: k3,
                             val: rng.random(),
                         },
                     ],
@@ -213,6 +216,16 @@ enum Operation {
     Get { key: u64 },
     Put { pair: KVPair<u64, u8> },
     TriPut { pairs: [KVPair<u64, u8>; 3] },
+}
+
+// helper function to generate a random uints that is different than 2 other uints
+fn unique_random(k1: u64, k2: u64, rng: &mut ThreadRng, key_range: u64) -> u64 {
+    let mut res = rng.random_range(0..key_range);
+    while res == k1 || res == k2 {
+        res = rng.random_range(0..key_range);
+    }
+
+    res
 }
 
 fn print_progress(i: usize, total: usize) {
